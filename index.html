@@ -1,0 +1,2160 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ykkr</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; touch-action: none; }
+        canvas { 
+            display: block; 
+            margin: 0 auto; 
+            background-color: #000; 
+            image-rendering: pixelated; 
+            image-rendering: crisp-edges;
+        }
+        @font-face {
+            font-family: 'GameFont';
+            src: url('font.ttf') format('truetype');
+        }
+    </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * ykkr - 横スクロール アクション x 弾幕ゲーム
+ * 各敵固有アニメーション ＆ 雫弾落下専用化・ステージ弾幕制御版
+ * （Xキー低速移動・退場時待機モーション・チュートリアル追加・ワカッタTVコマ数修正）
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+ctx.imageSmoothingEnabled = false;
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// === 素材の切り取り分割設定 ===
+const SPRITE_CONFIG = {
+    titleAnim:   { cols: 7, rows: 11, totalFrames: 74 },
+    playerWalk:  { cols: 2, rows: 3, totalFrames: 5 },
+    playerJump:  { cols: 4, rows: 5, totalFrames: 17 },
+    platforms:   { cols: 2, rows: 2, totalFrames: 3 },
+    bullets:     { cols: 4, rows: 5, totalFrames: 20 },
+    bgAll:       { cols: 1, rows: 3, totalFrames: 3 }
+};
+
+// 敵の設定 (アニメーション最大フレーム数等)
+const ENEMY_CONFIGS = {
+    1:  { key: 'enemy1',  cols: 3, rows: 3, totalFrames: 8,  retreatAfterAttack: true },
+    2:  { key: 'enemy2',  cols: 3, rows: 3, totalFrames: 9,  retreatAfterAttack: false },
+    3:  { key: 'enemy3',  cols: 3, rows: 3, totalFrames: 10, retreatAfterAttack: false },
+    4:  { key: 'enemy4',  cols: 3, rows: 4, totalFrames: 11, retreatAfterAttack: false },
+    5:  { key: 'enemy5',  cols: 3, rows: 3, totalFrames: 7,  retreatAfterAttack: false },
+    6:  { key: 'enemy6',  cols: 3, rows: 3, totalFrames: 8,  retreatAfterAttack: false },
+    7:  { key: 'enemy7',  cols: 3, rows: 3, totalFrames: 9,  retreatAfterAttack: false },
+    8:  { key: 'enemy8',  cols: 3, rows: 4, totalFrames: 11, retreatAfterAttack: false },
+    9:  { key: 'enemy9',  cols: 3, rows: 3, totalFrames: 7,  retreatAfterAttack: true },
+    10: { key: 'enemy10', cols: 3, rows: 4, totalFrames: 10, retreatAfterAttack: true },
+    11: { key: 'enemy11', cols: 2, rows: 3, totalFrames: 6,  retreatAfterAttack: true } // 横2×縦3（全6コマ）
+};
+
+// === 入力処理 ===
+const TARGET_VISIBLE_PLATFORMS = 16;
+let debugMode = false;
+let gameSpeedMultiplier = 1;
+const input = { keys: {}, justPressed: {}, touch: { left: false, right: false, jump: false, moveX: 0, joystickActive: false } };
+window.addEventListener('keydown', e => {
+    if (e.key === 'F3') {
+        debugMode = !debugMode;
+        e.preventDefault();
+        return;
+    }
+    if (e.key === 'F4') {
+        gameSpeedMultiplier = gameSpeedMultiplier === 1 ? 2 : 1;
+        e.preventDefault();
+        return;
+    }
+    if (!input.keys[e.key]) input.justPressed[e.key] = true;
+    input.keys[e.key] = true;
+    if (['Enter', 'ArrowLeft', 'ArrowRight', 'ArrowUp', ' '].includes(e.key)) e.preventDefault();
+});
+window.addEventListener('keyup', e => input.keys[e.key] = false);
+function getTitleButtonRect() {
+    const titleSize = Math.min(60, canvas.width * 0.11, canvas.height * 0.09);
+    const titleY = Math.max(titleSize + 8, Math.min(canvas.height * 0.40, canvas.height - 155));
+    const bw = Math.min(300, canvas.width * 0.62), bh = Math.min(60, canvas.height * 0.09);
+    const bx = (canvas.width - bw) / 2;
+    const by = Math.max(titleY + 18, Math.min(canvas.height * 0.48, canvas.height - bh - 115));
+    return { bx, by, bw, bh };
+}
+function getHowToButtonRect() {
+    const r = getTitleButtonRect();
+    return { bx:r.bx, by:r.by+r.bh+16, bw:r.bw, bh:r.bh };
+}
+function getHowToBackButtonRect() {
+    const bw = Math.min(300, canvas.width * 0.62), bh = Math.min(58, canvas.height * 0.085);
+    return { bx:(canvas.width-bw)/2, by:canvas.height*0.84, bw, bh };
+}
+function getChoiceRects() {
+    const bw = Math.min(380, canvas.width * 0.78), bh = Math.min(68, canvas.height * 0.11);
+    const bx = (canvas.width - bw) / 2;
+    return [{bx,by:canvas.height*0.40,bw,bh},{bx,by:canvas.height*0.57,bw,bh}];
+}
+function getStageClearButtonRect() {
+    const bw = Math.min(420, canvas.width * 0.78), bh = Math.min(72, canvas.height * 0.11);
+    return {bx:(canvas.width-bw)/2,by:canvas.height*0.60,bw,bh};
+}
+function getGameOverRestartButtonRect() {
+    const bw = Math.min(360, canvas.width * 0.66), bh = Math.min(68, canvas.height * 0.10);
+    return {bx:(canvas.width-bw)/2, by:canvas.height*0.61, bw, bh};
+}
+function isPointInRect(x,y,r){return x>=r.bx&&x<=r.bx+r.bw&&y>=r.by&&y<=r.by+r.bh;}
+
+canvas.addEventListener('click', e => {
+    const r = canvas.getBoundingClientRect();
+    const x = e.clientX-r.left, y=e.clientY-r.top;
+    if(gameState==='TITLE'&&isTitleAnimFinished){
+        if(isPointInRect(x,y,getTitleButtonRect())) setGameState('TUTORIAL_CHOICE');
+        else if(isPointInRect(x,y,getHowToButtonRect())) setGameState('HOW_TO_PLAY');
+    }else if(gameState==='HOW_TO_PLAY'){
+        if(isPointInRect(x,y,getHowToBackButtonRect())) setGameState('TITLE');
+    }else if(gameState==='TUTORIAL_CHOICE'){
+        const rs=getChoiceRects();
+        if(isPointInRect(x,y,rs[0])) beginTutorial();
+        else if(isPointInRect(x,y,rs[1])) beginStageWithoutTutorial();
+    }else if(gameState==='STAGE_CLEAR'){
+        if(isPointInRect(x,y,getStageClearButtonRect())) proceedToNextStage();
+    }else if(gameState==='GAMEOVER' && hitCount >= MAX_PLAYER_HP){
+        if(isPointInRect(x,y,getGameOverRestartButtonRect())) restartGame();
+    }
+});
+canvas.addEventListener('touchstart',handleTouch,{passive:false});
+canvas.addEventListener('touchmove',handleTouch,{passive:false});
+canvas.addEventListener('touchend',handleTouch,{passive:false});
+canvas.addEventListener('touchcancel',handleTouch,{passive:false});
+function handleTouch(e){
+    e.preventDefault();
+    input.touch={left:false,right:false,jump:false,moveX:0,joystickActive:false};
+    const rect=canvas.getBoundingClientRect();
+    const joyX=Math.min(110,canvas.width*0.16),joyY=canvas.height-92;
+    const joyR=Math.min(70,Math.max(48,canvas.width*0.075));
+    const jumpX=canvas.width-Math.min(88,canvas.width*0.13),jumpY=canvas.height-92;
+    const jumpR=Math.min(58,Math.max(44,canvas.width*0.065));
+    for(let i=0;i<e.touches.length;i++){
+        const t=e.touches[i],x=t.clientX-rect.left,y=t.clientY-rect.top;
+        if(gameState==='TITLE'&&isTitleAnimFinished){
+            if(isPointInRect(x,y,getTitleButtonRect())) setGameState('TUTORIAL_CHOICE');
+            else if(isPointInRect(x,y,getHowToButtonRect())) setGameState('HOW_TO_PLAY');
+            continue;
+        }
+        if(gameState==='HOW_TO_PLAY'){
+            if(isPointInRect(x,y,getHowToBackButtonRect())) setGameState('TITLE');
+            continue;
+        }
+        if(gameState==='TUTORIAL_CHOICE'){
+            const rs=getChoiceRects();
+            if(isPointInRect(x,y,rs[0])) beginTutorial();
+            else if(isPointInRect(x,y,rs[1])) beginStageWithoutTutorial();
+            continue;
+        }
+        if(gameState==='STAGE_CLEAR'){
+            if(isPointInRect(x,y,getStageClearButtonRect())) proceedToNextStage();
+            continue;
+        }
+        if(gameState==='GAMEOVER'){
+            if(hitCount >= MAX_PLAYER_HP && isPointInRect(x,y,getGameOverRestartButtonRect())) restartGame();
+            continue;
+        }
+        if(gameState!=='PLAYING') continue;
+        const dx=x-joyX,dy=y-joyY,dist=Math.hypot(dx,dy);
+        if(x<canvas.width*0.48&&y>canvas.height*0.56&&dist<=joyR*1.65){
+            const c=Math.min(dist,joyR),nx=dist?dx/dist:0;
+            input.touch.moveX=Math.max(-1,Math.min(1,nx*c/joyR));
+            input.touch.joystickActive=true;
+            input.touch.left=input.touch.moveX<-0.20;
+            input.touch.right=input.touch.moveX>0.20;
+        }else if(x>canvas.width*0.52&&y>canvas.height*0.56&&Math.hypot(x-jumpX,y-jumpY)<=jumpR*1.45){
+            input.touch.jump=true;
+        }
+    }
+}
+
+// === 画像ロード ===
+const images = {};
+const imageSources = {
+    titleAnim: 'Title Animation.png',
+    bgAll: '街背景 昼・夕焼け・夜景.png',
+    playerWalk: 'プレイヤー横スクロール.png',
+    playerJump: 'プレイヤー横スクロール＿ジャンプ.png',
+    hitbox: '自機.png',
+    bullets: '弾幕用（4色).png',
+    platforms: '足場.png',
+    enemy1: '敵 (65111217).png',
+    enemy2: '敵 (ウシナッタ・イタリアーノ).png',
+    enemy3: '敵 (オトクガエル).png',
+    enemy4: '敵 (カモノマンナカ).png', 
+    enemy5: '敵 (クイヤ).png',
+    enemy6: '敵 (クモノメ).png', 
+    enemy7: '敵 (バキドラ).png',
+    enemy8: '敵 (ハチトムシ).png', 
+    enemy9: '敵 (リードバー).png',
+    enemy10: '敵 (ロングロングアゴー).png',
+    enemy11: '敵 (ワカッタTV).png'
+};
+
+let imagesLoaded = 0;
+const totalImages = Object.keys(imageSources).length;
+for (let key in imageSources) {
+    images[key] = new Image();
+    images[key].src = imageSources[key];
+    images[key].onload = () => { imagesLoaded++; };
+}
+
+function drawSprite(img, cols, rows, index, x, y, w, h, flipX = false) {
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+    const sw = img.naturalWidth / cols;
+    const sh = img.naturalHeight / rows;
+    const idx = Math.max(0, index - 1); 
+    const sx = (idx % cols) * sw;
+    const sy = Math.floor(idx / cols) * sh;
+
+    // 元画像の縦横比を維持し、指定領域内に収めて描画する。
+    const fit = Math.min(w / sw, h / sh);
+    const dw = sw * fit;
+    const dh = sh * fit;
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.translate(x + w / 2, y + h / 2);
+    if (flipX) ctx.scale(-1, 1);
+    ctx.drawImage(img, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh);
+    ctx.restore();
+}
+
+function drawRotatedSprite(img, cols, rows, index, cx, cy, w, h, angle) {
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+    const sw = img.naturalWidth / cols;
+    const sh = img.naturalHeight / rows;
+    const idx = Math.max(0, index - 1);
+    const sx = (idx % cols) * sw;
+    const sy = Math.floor(idx / cols) * sh;
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    const fit = Math.min(w / sw, h / sh);
+    const dw = sw * fit, dh = sh * fit;
+    ctx.drawImage(img, sx, sy, sw, sh, -dw/2, -dh/2, dw, dh);
+    ctx.restore();
+}
+
+function drawSpriteFitScreen(img, cols, rows, index) {
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+    const sw = img.naturalWidth / cols;
+    const sh = img.naturalHeight / rows;
+    const scale = Math.min(canvas.width / sw, canvas.height / sh);
+    const dw = sw * scale;
+    const dh = sh * scale;
+    const dx = (canvas.width - dw) / 2;
+    const dy = (canvas.height - dh) / 2;
+    drawSprite(img, cols, rows, index, dx, dy, dw, dh);
+}
+
+// === ゲーム状態 ===
+let gameState = 'TITLE';
+let stage = 1;
+let frameCount = 0;
+const MAX_PLAYER_HP = 25;
+let hitCount = 0;
+let playerInvincibleUntil = 0;
+let gameStartTime = 0;
+let clearTimeMs = 0;
+let stageStartFrame = 0;
+let bossStartFrame = 0;
+let gameResult = 'CLEAR';
+
+let titleAnimFrame = 1;
+let titleAnimTimer = 0;
+let isTitleAnimFinished = false;
+
+// プレイヤー（90x120）
+const player = {
+    x: 100, y: 300, w: 90, h: 120,
+    vx: 0, vy: 0, speed: 3.6, jumpPower: 13.68,
+    dir: 1, 
+    isJumping: false,
+    animFrame: 1,
+    shootTimer: 0
+};
+
+let playerBullets = [];
+let enemyBullets = [];
+let enemies = [];
+let platforms = [];
+let waveState = 'STAGE1_ZAKO1';
+let stage1PhaseIndex = 0;
+let tutorialActive = false;
+let tutorialComplete = false;
+let choiceSelection = 0;
+let tutorialStep=0;
+let tutorialStartX=0;
+let tutorialJumpSeen=false;
+let tutorialJumpLanded=false;
+let tutorialAttackStarted=false;
+let stageClearSelection=0;
+
+// 画面遷移：一度完全に暗転してから次の画面を表示する。
+let transitionActive = false;
+let transitionPhase = 'none';
+let transitionAlpha = 0;
+let transitionTargetState = null;
+const TRANSITION_SPEED = 0.14;
+
+// 画面内UIのフェードイン。
+let uiFadeProgress = 1;
+const UI_FADE_SPEED = 0.08;
+let titleUiFadeStarted = false;
+
+function setGameState(nextState) {
+    if (nextState === gameState && !transitionActive) return;
+    transitionTargetState = nextState;
+    transitionActive = true;
+    transitionPhase = 'out';
+    transitionAlpha = 0;
+    uiFadeProgress = 0;
+}
+
+function updateTransition() {
+    if (transitionActive) {
+        if (transitionPhase === 'out') {
+            transitionAlpha = Math.min(1, transitionAlpha + TRANSITION_SPEED);
+            if (transitionAlpha >= 1) {
+                gameState = transitionTargetState;
+                transitionPhase = 'in';
+                uiFadeProgress = 0;
+            }
+        } else if (transitionPhase === 'in') {
+            transitionAlpha = Math.max(0, transitionAlpha - TRANSITION_SPEED);
+            if (transitionAlpha <= 0) {
+                transitionAlpha = 0;
+                transitionPhase = 'none';
+                transitionActive = false;
+                transitionTargetState = null;
+            }
+        }
+    }
+
+    if (!transitionActive) {
+        uiFadeProgress = Math.min(1, uiFadeProgress + UI_FADE_SPEED);
+    }
+}
+
+function easeOutCubic(t) {
+    return 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
+}
+
+// === ステージ進行管理 ===
+function startStage(stg) {
+    stage = stg;
+    platforms.forEach(p => p.type = stage);
+    // ステージ開始時はプレイヤーのHPを全回復する。
+    hitCount = 0;
+    enemies = [];
+    playerBullets = [];
+    enemyBullets = [];
+    stageStartFrame = frameCount;
+    stage1PhaseIndex = 0;
+
+    if (stage === 1) {
+        spawnStage1Zako1();
+    } else if (stage === 2) {
+        spawnStage2Zako1();
+    } else {
+        spawnStage3Zako1();
+    }
+}
+
+function safeEnemyY(requestedY, enemyH) {
+    const top = 18;
+    const bottom = Math.max(top, canvas.height - enemyH - 105);
+    return Math.max(top, Math.min(bottom, requestedY));
+}
+
+function safeEnemyX(requestedX, enemyW) {
+    // 進入前は画面右外、停止位置は必ず画面内。
+    const minX = Math.max(20, canvas.width * 0.36);
+    const maxX = Math.max(minX, canvas.width - enemyW - 36);
+    return Math.max(minX, Math.min(maxX, requestedX));
+}
+
+function spawnTutorialZako() {
+    waveState='TUTORIAL_ATTACK';
+    const dummy=createEnemy(11,false,canvas.width+90,canvas.height*0.42);
+    dummy.targetX=Math.min(canvas.width-dummy.w-50,canvas.width*0.62);
+    dummy.hp=10; dummy.maxHp=10; dummy.tutorialDummy=true;
+    enemies.push(dummy);
+}
+
+// ステージ1：雑魚戦1
+function spawnStage1Zako1() {
+    waveState = 'STAGE1_ZAKO1';
+    enemies.push(createEnemy(2, false, canvas.width + 90, canvas.height * 0.28));
+    enemies.push(createEnemy(9, false, canvas.width + 220, canvas.height * 0.55));
+    enemies.push(createEnemy(9, false, canvas.width + 350, canvas.height * 0.18));
+}
+
+// ステージ1：雑魚戦2
+function spawnStage1Zako2() {
+    waveState = 'STAGE1_ZAKO2';
+    enemies.push(createEnemy(2, false, canvas.width + 90, canvas.height * 0.23));
+    enemies.push(createEnemy(9, false, canvas.width + 220, canvas.height * 0.47));
+    enemies.push(createEnemy(2, false, canvas.width + 350, canvas.height * 0.67));
+    enemies.push(createEnemy(9, false, canvas.width + 480, canvas.height * 0.34));
+}
+
+// ステージ1：中ボス
+function spawnStage1MidBoss() {
+    waveState = 'STAGE1_MIDBOSS';
+    const mid = createEnemy(4, true, canvas.width + 120, canvas.height * 0.37);
+    mid.hp = 180;
+    mid.maxHp = 180;
+    mid.role = 'midboss';
+    mid.targetX = Math.max(50, canvas.width - mid.w - 90);
+    enemies.push(mid);
+}
+
+// ステージ1：雑魚戦3
+function spawnStage1Zako3() {
+    waveState = 'STAGE1_ZAKO3';
+    enemies.push(createEnemy(2, false, canvas.width + 90, canvas.height * 0.18));
+    enemies.push(createEnemy(9, false, canvas.width + 210, canvas.height * 0.39));
+    enemies.push(createEnemy(2, false, canvas.width + 330, canvas.height * 0.60));
+    enemies.push(createEnemy(9, false, canvas.width + 450, canvas.height * 0.28));
+}
+
+// ステージ1：ボス
+function spawnStage1Boss() {
+    waveState = 'STAGE1_BOSS';
+    const boss = createEnemy(4, true, canvas.width + 130, canvas.height * 0.32);
+    boss.hp = 360;
+    boss.maxHp = 360;
+    boss.role = 'boss';
+    boss.targetX = Math.max(60, canvas.width - boss.w - 80);
+    enemies.push(boss);
+}
+
+function spawnStage2Zako1() {
+    waveState = 'STAGE2_ZAKO1';
+    enemies.push(createEnemy(1, false, canvas.width + 100, canvas.height * 0.22));
+    enemies.push(createEnemy(3, false, canvas.width + 250, canvas.height * 0.50));
+    enemies.push(createEnemy(5, false, canvas.width + 400, canvas.height * 0.68));
+}
+
+function spawnStage2Zako2() {
+    waveState = 'STAGE2_ZAKO2';
+    enemies.push(createEnemy(1, false, canvas.width + 100, canvas.height * 0.28));
+    enemies.push(createEnemy(3, false, canvas.width + 240, canvas.height * 0.55));
+    enemies.push(createEnemy(5, false, canvas.width + 380, canvas.height * 0.18));
+    enemies.push(createEnemy(1, false, canvas.width + 520, canvas.height * 0.40));
+}
+
+function spawnStage2MidBoss() {
+    waveState = 'STAGE2_MIDBOSS';
+    // ステージ1とは別キャラクター。難易度を一段階上げる。
+    const mid = createEnemy(8, true, canvas.width + 120, canvas.height * 0.34);
+    mid.hp = 220;
+    mid.maxHp = 220;
+    mid.role = 'midboss';
+    mid.retreatAfterAttack = false;
+    mid.midbossStage = 2;
+    mid.targetX = Math.max(50, canvas.width - mid.w - 90);
+    enemies.push(mid);
+}
+
+function spawnStage2Zako3() {
+    waveState = 'STAGE2_ZAKO3';
+    enemies.push(createEnemy(1, false, canvas.width + 90, canvas.height * 0.17));
+    enemies.push(createEnemy(3, false, canvas.width + 210, canvas.height * 0.39));
+    enemies.push(createEnemy(5, false, canvas.width + 330, canvas.height * 0.60));
+    enemies.push(createEnemy(1, false, canvas.width + 450, canvas.height * 0.28));
+}
+
+function spawnStage2Boss() {
+    waveState = 'STAGE2_BOSS';
+    // ステージ1とは別キャラクター。耐久・弾速・攻撃テンポを一段階強化。
+    const boss = createEnemy(8, true, canvas.width + 130, canvas.height * 0.32);
+    boss.hp = 430;
+    boss.maxHp = 430;
+    boss.role = 'boss';
+    boss.retreatAfterAttack = false;
+    boss.bossStage = 2;
+    boss.bossPatternOffset = 2;
+    boss.targetX = Math.max(60, canvas.width - boss.w - 80);
+    enemies.push(boss);
+}
+
+function spawnStage3Zako1() {
+    waveState = 'STAGE3_ZAKO1';
+    enemies.push(createEnemy(7, false, canvas.width + 100, canvas.height * 0.20));
+    enemies.push(createEnemy(10, false, canvas.width + 250, canvas.height * 0.48));
+    enemies.push(createEnemy(11, false, canvas.width + 400, canvas.height * 0.68));
+}
+
+function spawnStage3Zako2() {
+    waveState = 'STAGE3_ZAKO2';
+    enemies.push(createEnemy(7, false, canvas.width + 100, canvas.height * 0.25));
+    enemies.push(createEnemy(10, false, canvas.width + 240, canvas.height * 0.52));
+    enemies.push(createEnemy(11, false, canvas.width + 380, canvas.height * 0.17));
+    enemies.push(createEnemy(7, false, canvas.width + 520, canvas.height * 0.41));
+}
+
+function spawnStage3MidBoss() {
+    waveState = 'STAGE3_MIDBOSS';
+    // ステージ1・2とは別キャラクター。最終ステージの中ボスとしてさらに強化。
+    const mid = createEnemy(9, true, canvas.width + 120, canvas.height * 0.36);
+    mid.hp = 260;
+    mid.maxHp = 260;
+    mid.role = 'midboss';
+    mid.retreatAfterAttack = false;
+    mid.midbossStage = 3;
+    mid.targetX = Math.max(50, canvas.width - mid.w - 90);
+    enemies.push(mid);
+}
+
+function spawnStage3Zako3() {
+    waveState = 'STAGE3_ZAKO3';
+    enemies.push(createEnemy(7, false, canvas.width + 90, canvas.height * 0.18));
+    enemies.push(createEnemy(10, false, canvas.width + 210, canvas.height * 0.39));
+    enemies.push(createEnemy(11, false, canvas.width + 330, canvas.height * 0.60));
+    enemies.push(createEnemy(7, false, canvas.width + 450, canvas.height * 0.28));
+}
+
+function spawnStage3Boss() {
+    waveState = 'STAGE3_BOSS';
+    // ステージ1・2とは別キャラクター。最終ボスとして最大難易度。
+    const boss = createEnemy(6, true, canvas.width + 130, canvas.height * 0.32);
+    boss.hp = 520;
+    boss.maxHp = 520;
+    boss.role = 'boss';
+    boss.retreatAfterAttack = false;
+    boss.bossStage = 3;
+    boss.bossPatternOffset = 5;
+    boss.targetX = Math.max(60, canvas.width - boss.w - 80);
+    enemies.push(boss);
+}
+
+function createEnemy(id, isBoss, startX, startY) {
+    const cfg = ENEMY_CONFIGS[id];
+    const baseW = isBoss ? 135 : 90;
+    const baseH = isBoss ? 180 : 120;
+    const hpVal = isBoss ? 200 : 16;
+    const safeY = safeEnemyY(startY, baseH);
+
+    return {
+        id: id,
+        cfgKey: cfg.key,
+        cols: cfg.cols,
+        rows: cfg.rows,
+        totalFrames: cfg.totalFrames,
+        retreatAfterAttack: isBoss ? false : cfg.retreatAfterAttack,
+        isBoss: isBoss,
+        x: startX,
+        targetX: safeEnemyX(canvas.width - (isBoss ? 220 : 180), baseW),
+        y: safeY,
+        baseY: safeY,
+        w: baseW,
+        h: baseH,
+        hp: hpVal,
+        maxHp: hpVal,
+        frame: 1,
+        animTimer: 0,
+        animState: 'MOVE',
+        retreating: false,
+        attackDone: false,
+        hasRetreated: false,
+        wasVisible: false,
+        offscreenFrames: 0,
+        tutorialDummy: false,
+        role: isBoss ? 'boss' : 'zako',
+        bossStage: isBoss ? stage : 0,
+        bossPatternOffset: 0,
+        midbossStage: 0,
+        attackCooldown: 0
+    };
+}
+
+// === 弾幕生成処理 ===
+function spawnEnemyBullets(enemy) {
+    // キャラクターごとに弾の色（行）と攻撃タイプを固定。
+    // 雑魚は避けやすく、中ボス・ボスは明確に難しくなるように調整。
+    const ATTACK_PROFILE = {
+        1:  { row: 1, type: 'target', speed: 1.9 },
+        2:  { row: 2, type: 'ring',   speed: 1.45 },
+        3:  { row: 3, type: 'fan',    speed: 2.15 },
+        4:  { row: 4, type: 'line',   speed: 2.8 },
+        5:  { row: 5, type: 'target', speed: 2.1 },
+        6:  { row: 1, type: 'spiral', speed: 2.7 },
+        7:  { row: 2, type: 'fan',    speed: 2.0 },
+        8:  { row: 3, type: 'ring',   speed: 2.1 },
+        9:  { row: 4, type: 'target', speed: 2.0 },
+        10: { row: 5, type: 'spiral', speed: 2.4 },
+        11: { row: 1, type: 'line',   speed: 3.0 }
+    };
+
+    const profile = { ...(ATTACK_PROFILE[enemy.id] || ATTACK_PROFILE[1]) };
+    const isLeaderBar = stage === 1 && enemy.id === 9;
+    const ZAKO_ATTACK_COOLDOWN = 90; // 約1.5秒。リードバーだけは例外。
+    if (enemy.role === 'zako' && !isLeaderBar && enemy.attackCooldown > 0) return;
+
+    if (enemy.role === 'midboss') profile.speed *= 1.35 * (enemy.midbossStage === 3 ? 1.05 : (enemy.midbossStage === 2 ? 1.02 : 1.0));
+    if (enemy.role === 'boss') profile.speed *= 1.55 * (enemy.bossStage === 3 ? 1.16 : (enemy.bossStage === 2 ? 1.08 : 1.0));
+    const stg = stage;
+    const ex = enemy.x + enemy.w / 2;
+    const ey = enemy.y + enemy.h / 2;
+    const px = player.x + player.w / 2;
+    const py = player.y + player.h / 2;
+
+    let targetAngle = Math.atan2(py - ey, px - ex);
+
+    // 雑魚の弾幕は短く、間隔を空ける。中ボス・ボスは連続的に圧をかける。
+    const attackScale = enemy.role === 'boss' ? 1.0 : (enemy.role === 'midboss' ? 0.9 : 0.62);
+
+    const TARGET_BULLETS = [2, 6, 10];               
+    const RING_BULLETS   = [1, 5, 9, 3, 7, 11];       
+    const LINE_BULLETS   = [4, 8, 12];                
+    const FAN_BULLETS    = [1, 5, 9];                 
+    const DROPDOWN_BULLETS = [3, 7, 11, 15, 19];      
+
+    function getRandom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+    function fireTargeting(speed = 3) {
+        let f = (profile.row - 1) * 4 + 1;
+        enemyBullets.push({ x: ex, y: ey, vx: Math.cos(targetAngle) * speed, vy: Math.sin(targetAngle) * speed, frame: f });
+    }
+
+    function fireRing(count = 8, speed = 2.5) {
+        let f = (profile.row - 1) * 4 + 2;
+        for (let i = 0; i < count; i++) {
+            let a = (Math.PI * 2 / count) * i;
+            enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, frame: f });
+        }
+    }
+
+    function fireLine(speed = 4.5) {
+        let f = (profile.row - 1) * 4 + 4;
+        enemyBullets.push({ x: ex, y: ey, vx: Math.cos(targetAngle) * speed, vy: Math.sin(targetAngle) * speed, frame: f });
+    }
+
+    function fireFan(count = 5, spread = 0.5, speed = 3.5) {
+        let f = (profile.row - 1) * 4 + 1;
+        for (let i = 0; i < count; i++) {
+            let a = targetAngle - (spread / 2) + (spread / (count - 1)) * i;
+            enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, frame: f });
+        }
+    }
+
+    function fireSpiral(speed = 4) {
+        let f = (profile.row - 1) * 4 + 1;
+        let baseA = frameCount * 0.2;
+        const count = enemy.role === 'boss' ? 6 : (enemy.role === 'midboss' ? 5 : 2);
+        for (let i = 0; i < count; i++) {
+            let a = baseA + (Math.PI / 2) * i;
+            enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, frame: f });
+        }
+    }
+
+    function fireParticle(speed = 4.5) {
+        let f = (profile.row - 1) * 4 + 3;
+        let a = targetAngle + (Math.random() - 0.5) * 0.8;
+        let s = speed * (0.8 + Math.random() * 0.4);
+        enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * s, vy: Math.sin(a) * s, frame: f });
+    }
+
+    function fireDropDown() {
+        let f = (profile.row - 1) * 4 + 3;
+        let spawnX = Math.random() * (canvas.width - 100) + 50;
+        // 画面上端から降る弾幕は使用しない。
+    }
+
+    // カモノマンナカ専用：弓を放った瞬間に、矢の弾幕を一斉発射する。
+    // 4/8/12フレームを混ぜ、同じ瞬間に複数方向へ飛び出す「一撃の弾幕」にする。
+    function fireKamonoBurst(speed = 3.0) {
+        const arrowFrames = [4, 8, 12];
+        const count = enemy.role === 'boss' ? 17 : (enemy.role === 'midboss' ? 15 : 11);
+        const spread = enemy.role === 'boss' ? 0.92 : (enemy.role === 'midboss' ? 0.78 : 0.62);
+        for (let i = 0; i < count; i++) {
+            const t = count === 1 ? 0 : i / (count - 1);
+            const a = targetAngle - spread / 2 + spread * t;
+            const rowOffset = (i % 3) - 1;
+            const s = speed * (1 + rowOffset * 0.06);
+            enemyBullets.push({
+                x: ex, y: ey,
+                vx: Math.cos(a) * s,
+                vy: Math.sin(a) * s,
+                frame: arrowFrames[i % arrowFrames.length]
+            });
+        }
+    }
+
+    if (enemy.id === 4) {
+        fireKamonoBurst(enemy.role === 'boss' ? 3.35 : (enemy.role === 'midboss' ? 3.0 : 2.85));
+        return;
+    }
+
+    // 雑魚敵は「1回の攻撃＝10発」で固定。
+    // ステージ2は螺旋・扇・リング・狙い撃ちを組み合わせる。
+    // リードバー（ステージ1）の連射仕様はそのまま維持する。
+    if (enemy.role === 'zako' && !(stage === 1 && enemy.id === 9)) {
+        if (stage === 2) {
+            if (enemy.id === 1) {
+                // 螺旋6 + 追尾4 = 10発
+                const spiralCount = 6;
+                for (let i = 0; i < spiralCount; i++) {
+                    const a = frameCount * 0.16 + (Math.PI * 2 / spiralCount) * i;
+                    enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * profile.speed, vy: Math.sin(a) * profile.speed, frame: (profile.row - 1) * 4 + 1 });
+                }
+                for (let i = 0; i < 4; i++) {
+                    const a = targetAngle + (i - 1.5) * 0.075;
+                    enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * profile.speed * 1.08, vy: Math.sin(a) * profile.speed * 1.08, frame: (profile.row - 1) * 4 + 1 });
+                }
+            } else if (enemy.id === 3) {
+                // 扇6 + 螺旋4 = 10発
+                fireFan(6, 0.92, profile.speed);
+                for (let i = 0; i < 4; i++) {
+                    const a = frameCount * 0.12 + (Math.PI * 2 / 4) * i + 0.15;
+                    enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * profile.speed * 0.88, vy: Math.sin(a) * profile.speed * 0.88, frame: (profile.row - 1) * 4 + 1 });
+                }
+            } else if (enemy.id === 5) {
+                // リング7 + 追尾3 = 10発
+                fireRing(7, profile.speed * 0.86);
+                for (let i = 0; i < 3; i++) {
+                    const a = targetAngle + (i - 1) * 0.10;
+                    enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * profile.speed * 1.05, vy: Math.sin(a) * profile.speed * 1.05, frame: (profile.row - 1) * 4 + 1 });
+                }
+            } else {
+                // その他のステージ2雑魚：広めの扇10発
+                fireFan(10, 1.15, profile.speed);
+            }
+            return;
+        }
+
+        // ステージ1・3の通常雑魚も、1回の攻撃を10発に統一。
+        if (profile.type === 'ring') {
+            fireRing(10, profile.speed);
+        } else if (profile.type === 'fan') {
+            fireFan(10, 1.05, profile.speed);
+        } else if (profile.type === 'spiral') {
+            const count = 10;
+            for (let i = 0; i < count; i++) {
+                const a = frameCount * 0.14 + (Math.PI * 2 / count) * i;
+                enemyBullets.push({ x: ex, y: ey, vx: Math.cos(a) * profile.speed, vy: Math.sin(a) * profile.speed, frame: (profile.row - 1) * 4 + 1 });
+            }
+        } else {
+            // 狙い撃ち・直線系は狭い扇10発にする。
+            fireFan(10, 0.72, profile.speed);
+        }
+        enemy.attackCooldown = ZAKO_ATTACK_COOLDOWN;
+        return;
+    }
+
+    // 中ボス専用：高密度弾幕（従来の中ボス攻撃に対して約15倍の発射密度を狙う）。
+    // 中ボス自身の弾色はキャラクター4の色（row 4）で統一しつつ、攻撃種類だけを周期的に変える。
+    if (enemy.role === 'midboss') {
+        const fTarget = 13; // row 4 / 1st pattern
+        const fRing = 14;   // row 4 / 2nd pattern
+        const fParticle = 15; // row 4 / 3rd pattern
+        const fLine = 16;   // row 4 / 4th pattern
+        const phaseCount = enemy.midbossStage === 3 ? 6 : 6;
+        const phaseOffset = enemy.midbossStage === 3 ? 2 : (enemy.midbossStage === 2 ? 1 : 0);
+        const phase = (Math.floor(frameCount / 12) + phaseOffset) % phaseCount;
+
+        if (!enemy.midbossPatternStep) enemy.midbossPatternStep = 0;
+        enemy.midbossPatternStep++;
+
+        const midbossSpeedScale = 0.85; // 中ボス弾速を現状から約15%低下
+        const midbossDensity = enemy.midbossStage === 3 ? 0.68 : (enemy.midbossStage === 2 ? 0.62 : 0.56);
+        if (enemy.midbossDensityAccumulator == null) enemy.midbossDensityAccumulator = 0;
+        const shouldFireMidBullet = () => {
+            enemy.midbossDensityAccumulator += midbossDensity;
+            if (enemy.midbossDensityAccumulator >= 1) {
+                enemy.midbossDensityAccumulator -= 1;
+                return true;
+            }
+            return false;
+        };
+        const addBullet = (a, speed, frame) => {
+            if (!shouldFireMidBullet()) return;
+            speed *= midbossSpeedScale;
+            enemyBullets.push({
+                x: ex, y: ey,
+                vx: Math.cos(a) * speed,
+                vy: Math.sin(a) * speed,
+                frame
+            });
+        };
+        const addVerticalBullet = (x, y, vx, vy, frame) => {
+            if (!shouldFireMidBullet()) return;
+            enemyBullets.push({ x, y, vx, vy, frame });
+        };
+
+        // 中ボス弾幕密度を現在の0.8倍に調整（前回比0.56倍）。攻撃パターンと弾速は維持。
+        // 6パターンの種類は維持しつつ、1回の発射を合計9発前後に抑える。
+        if (phase === 0) {
+            // 追尾2 + 扇3 + 直線4
+            for (const offset of [-0.07, 0.07]) addBullet(targetAngle + offset, 3.0, fTarget);
+            for (let i = 0; i < 3; i++) addBullet(targetAngle - 0.48 + i * 0.48, 2.7, fLine);
+            for (let i = 0; i < 4; i++) addBullet(targetAngle - 0.24 + i * 0.16, 4.0, fLine);
+        } else if (phase === 1) {
+            // リング7 + 追尾2
+            for (let i = 0; i < 7; i++) addBullet((Math.PI * 2 / 7) * i + frameCount * 0.025, 2.4, fRing);
+            for (const offset of [-0.08, 0.08]) addBullet(targetAngle + offset, 3.5, fTarget);
+        } else if (phase === 2) {
+            // 反転扇5 + 直線2 + 追尾2
+            for (let i = 0; i < 5; i++) addBullet(targetAngle + 0.72 - i * (1.44 / 4), 3.1, fLine);
+            for (let i = 0; i < 2; i++) addBullet(targetAngle - 0.08 + i * 0.16, 4.5, fLine);
+            for (const offset of [-0.06, 0.06]) addBullet(targetAngle + offset, 2.8, fTarget);
+        } else if (phase === 3) {
+            // 二重螺旋6 + 追尾3
+            for (let i = 0; i < 6; i++) {
+                const a = frameCount * 0.14 + (Math.PI * 2 / 6) * i;
+                addBullet(a, 2.6 + (i % 2) * 0.5, fParticle);
+            }
+            for (let i = -1; i <= 1; i++) addBullet(targetAngle + i * 0.14, 3.2, fTarget);
+        } else if (phase === 4) {
+            // 外向リング5 + 内向き扇2 + 落下弾2
+            for (let i = 0; i < 5; i++) addBullet((Math.PI * 2 / 5) * i - frameCount * 0.03, 2.2, fRing);
+            for (let i = 0; i < 2; i++) addBullet(targetAngle - 0.16 + i * 0.32, 3.6, fLine);
+            for (let i = 0; i < 2; i++) {
+                const spawnX = Math.max(35, Math.min(canvas.width - 35, px + (i === 0 ? -60 : 60)));
+                addVerticalBullet(spawnX, -20, 0, 4.5 * midbossSpeedScale, fParticle);
+            }
+        } else {
+            // 全方位7 + 追尾2（締め）
+            for (let i = 0; i < 7; i++) addBullet((Math.PI * 2 / 7) * i + frameCount * 0.05, 2.9, (i % 2 === 0 ? fRing : fParticle));
+            for (const offset of [-0.07, 0.07]) addBullet(targetAngle + offset, 4.0, fTarget);
+        }
+        return;
+    }
+
+    if (enemy.role === 'boss') {
+        const bossPhaseCount = enemy.bossStage === 3 ? 15 : (enemy.bossStage === 2 ? 13 : 15);
+        const bossPhaseOffset = enemy.bossPatternOffset || 0;
+        const phase=Math.floor(frameCount/42)%bossPhaseCount;
+        const fTarget=(profile.row-1)*4+1, fRing=(profile.row-1)*4+2, fParticle=(profile.row-1)*4+3, fLine=(profile.row-1)*4+4;
+        const bs=profile.speed;
+        const add=(a,speed,frame=fParticle)=>enemyBullets.push({x:ex,y:ey,vx:Math.cos(a)*speed,vy:Math.sin(a)*speed,frame});
+
+        // ステージ2・3は攻撃開始位置をずらし、同じ並びにならないようにする。
+        const effectivePhase = (phase + bossPhaseOffset) % 15;
+        if(enemy.bossStage === 2 && phase < 13){
+            if(effectivePhase===0){for(let i=0;i<18;i++)add(Math.PI*2*i/18+frameCount*0.025,bs*0.82,fRing);for(let i=-2;i<=2;i++)add(targetAngle+i*0.11,bs*1.1,fTarget);}
+            else if(effectivePhase===1){for(let i=0;i<10;i++)add(targetAngle-0.72+i*0.16,bs,fLine);for(let i=0;i<8;i++)add(frameCount*0.12+i*Math.PI*2/8,bs*0.75,fParticle);}
+            else if(effectivePhase===2){for(let n=0;n<2;n++)fireSpiral(bs*(0.8+n*0.08));for(let i=0;i<8;i++)add(targetAngle+(i-3.5)*0.14,bs*0.92,fTarget);}
+            else if(effectivePhase===3){for(let i=0;i<24;i++)add(Math.PI*2*i/24-frameCount*0.03,bs*0.76,fRing);for(let i=-2;i<=2;i++)add(targetAngle+i*0.13,bs*1.12,fTarget);}
+            else if(effectivePhase===4){for(let i=0;i<12;i++)add(targetAngle-0.9+i*0.165,bs*0.96,fLine);for(let i=0;i<12;i++)add(targetAngle+Math.PI-0.9+i*0.165,bs*0.82,fParticle);}
+            else if(effectivePhase===5){for(let i=0;i<12;i++)add(frameCount*0.12+i*Math.PI*2/12,bs*0.82,fParticle);for(let i=0;i<12;i++)add(-frameCount*0.12+i*Math.PI*2/12,bs*0.72,fRing);}
+            else if(effectivePhase===6){for(let i=0;i<28;i++)add(Math.PI*2*i/28+frameCount*0.02,bs*0.78,fRing);for(let i=-3;i<=3;i++)add(targetAngle+i*0.11,bs*1.14,fTarget);}
+            else if(effectivePhase===7){for(let side=-1;side<=1;side+=2)for(let i=0;i<9;i++)add(targetAngle+side*(0.17+i*0.09),bs*(0.84+i*0.02),fLine);}
+            else if(effectivePhase===8){for(let i=0;i<16;i++)add(frameCount*0.15+i*Math.PI*2/16,bs*0.84,fParticle);for(let i=0;i<16;i++)add(-frameCount*0.15+i*Math.PI*2/16,bs*0.74,fRing);}
+            else if(effectivePhase===9){for(let i=0;i<32;i++)add(Math.PI*2*i/32-frameCount*0.025,bs*0.7,fRing);for(let i=-2;i<=2;i++)add(targetAngle+i*0.12,bs*1.18,fTarget);}
+            else if(effectivePhase===10){for(let n=0;n<2;n++)fireSpiral(bs*(0.84+n*0.07));for(let i=0;i<9;i++)add(targetAngle-0.72+i*0.18,bs*0.94,fLine);}
+            else if(effectivePhase===11){for(let i=0;i<14;i++)add(frameCount*0.16+i*Math.PI*2/14,bs*0.88,fParticle);for(let i=0;i<14;i++)add(-frameCount*0.16+i*Math.PI*2/14,bs*0.76,fRing);for(let i=-3;i<=3;i++)add(targetAngle+i*0.1,bs*1.16,fTarget);}
+            else if(effectivePhase===12){for(let i=0;i<20;i++)add(Math.PI*2*i/20+frameCount*0.02,bs*0.8,fRing);for(let i=-4;i<=4;i++)add(targetAngle+i*0.1,bs*1.14,fTarget);}
+            return;
+        }
+        if(enemy.bossStage === 3 && phase < 15){
+            if(effectivePhase===0){for(let i=0;i<26;i++)add(Math.PI*2*i/26+frameCount*0.03,bs*0.8,fRing);for(let i=-3;i<=3;i++)add(targetAngle+i*0.1,bs*1.16,fTarget);}
+            else if(effectivePhase===1){for(let n=0;n<3;n++)fireSpiral(bs*(0.78+n*0.06));for(let i=0;i<12;i++)add(-frameCount*0.14+i*Math.PI*2/12,bs*0.8,fParticle);}
+            else if(effectivePhase===2){for(let n=0;n<2;n++)fireFan(12,1.15,bs*(0.94+n*0.06));for(let i=0;i<10;i++)add(targetAngle+Math.PI/2-0.85+i*0.19,bs*0.78,fLine);}
+            else if(effectivePhase===3){for(let i=0;i<40;i++)add(Math.PI*2*i/40-frameCount*0.03,bs*0.74,fRing);for(let i=-2;i<=2;i++)add(targetAngle+i*0.08,bs*1.22,fTarget);}
+            else if(effectivePhase===4){for(let i=0;i<16;i++)add(targetAngle-1.05+i*0.14,bs*1.02,fLine);for(let i=0;i<16;i++)add(targetAngle+Math.PI-1.05+i*0.14,bs*0.9,fParticle);}
+            else if(effectivePhase===5){for(let i=0;i<18;i++)add(frameCount*0.15+i*Math.PI*2/18,bs*0.86,fParticle);for(let i=0;i<18;i++)add(-frameCount*0.15+i*Math.PI*2/18,bs*0.8,fRing);}
+            else if(effectivePhase===6){for(let i=0;i<36;i++)add(Math.PI*2*i/36+frameCount*0.025,bs*0.78,fRing);for(let i=-4;i<=4;i++)add(targetAngle+i*0.1,bs*1.18,fTarget);}
+            else if(effectivePhase===7){for(let side=-1;side<=1;side+=2)for(let i=0;i<13;i++)add(targetAngle+side*(0.14+i*0.078),bs*(0.86+i*0.018),fLine);for(let i=0;i<10;i++)add(frameCount*0.13+i*Math.PI*2/10,bs*0.76,fParticle);}
+            else if(effectivePhase===8){for(let i=0;i<24;i++)add(Math.PI*2*i/24-frameCount*0.02,bs*0.76,fRing);for(let i=-3;i<=3;i++)add(targetAngle+i*0.11,bs*1.2,fTarget);}
+            else if(effectivePhase===9){for(let n=0;n<3;n++)fireSpiral(bs*(0.82+n*0.06));for(let i=0;i<11;i++)add(targetAngle-0.8+i*0.16,bs*0.96,fLine);}
+            else if(effectivePhase===10){for(let i=0;i<20;i++)add(frameCount*0.18+i*Math.PI*2/20,bs*0.88,fParticle);for(let i=0;i<20;i++)add(-frameCount*0.18+i*Math.PI*2/20,bs*0.76,fRing);}
+            else if(effectivePhase===11){for(let i=0;i<48;i++)add(Math.PI*2*i/48+frameCount*0.025,bs*0.68,fRing);for(let i=-4;i<=4;i++)add(targetAngle+i*0.09,bs*1.22,fTarget);}
+            else if(effectivePhase===12){for(let i=0;i<18;i++)add(targetAngle-0.95+i*0.112,bs*1.04,fLine);for(let i=0;i<18;i++)add(targetAngle+Math.PI-0.95+i*0.112,bs*0.9,fParticle);}
+            else if(effectivePhase===13){for(let i=0;i<22;i++)add(frameCount*0.19+i*Math.PI*2/22,bs*0.9,fParticle);for(let i=0;i<22;i++)add(-frameCount*0.19+i*Math.PI*2/22,bs*0.78,fRing);}
+            else {for(let i=0;i<56;i++)add(Math.PI*2*i/56-frameCount*0.025,bs*0.68,fRing);for(let i=-4;i<=4;i++)add(targetAngle+i*0.1,bs*1.24,fTarget);}
+            return;
+        }
+
+        if(phase===0){for(let k=0;k<3;k++)fireTargeting(bs*1.05);for(let i=0;i<9;i++)add(targetAngle-0.72+i*0.18,bs,fLine);}
+        else if(phase===1){for(let r=0;r<3;r++)fireRing(16,bs*(0.72+r*0.08));for(let i=-2;i<=2;i++)add(targetAngle+i*0.09,bs*1.12,fTarget);}
+        else if(phase===2){for(let n=0;n<3;n++)fireFan(11,1.1,bs*(0.92+n*0.06));}
+        else if(phase===3){for(let n=0;n<3;n++)fireSpiral(bs*(0.75+n*0.08));for(let i=0;i<9;i++)add(-frameCount*0.12+i*Math.PI*2/9,bs*0.75,fParticle);}
+        else if(phase===4){for(let i=0;i<30;i++)add(Math.PI*2*i/30+frameCount*0.02,bs*0.78,fRing);for(let i=0;i<6;i++)add(targetAngle+(i-2.5)*0.14,bs*1.16,fTarget);}
+        else if(phase===5){for(let i=0;i<14;i++)add(targetAngle-0.9+i*0.14,bs,fLine);for(let i=0;i<10;i++)add(targetAngle+Math.PI-0.63+i*0.14,bs*0.86,fParticle);}
+        else if(phase===6){for(let i=0;i<12;i++)add(frameCount*0.09+i*Math.PI*2/12,bs*0.8,fParticle);for(let i=0;i<12;i++)add(-frameCount*0.09+i*Math.PI*2/12,bs*0.8,fParticle);}
+        else if(phase===7){for(let i=0;i<20;i++)add(Math.PI*2*i/20+frameCount*0.025,bs*0.9,fRing);for(let i=0;i<7;i++)add(targetAngle+(i-3)*0.1,bs*1.15,fTarget);}
+        else if(phase===8){for(let side=-1;side<=1;side+=2)for(let i=0;i<9;i++)add(targetAngle+side*(0.18+i*0.09),bs*(0.82+i*0.025),fLine);for(let i=0;i<9;i++)add(frameCount*0.11+i*Math.PI*2/9,bs*0.72,fParticle);}
+        else if(phase===9){for(let i=0;i<24;i++)add(Math.PI*2*i/24-frameCount*0.035,bs*0.76,fRing);for(let i=0;i<5;i++)add(targetAngle+(i-2)*0.12,bs*1.2,fTarget);}
+        else if(phase===10){for(let i=0;i<15;i++)add(Math.PI*2*i/15+frameCount*0.05,bs*0.92,fParticle);for(let i=0;i<15;i++)add(Math.PI*2*i/15+Math.PI/15-frameCount*0.05,bs*0.72,fRing);}
+        else if(phase===11){for(let row=0;row<3;row++)for(let i=0;i<7;i++)add(targetAngle-(0.6-row*0.25)+i*0.2,bs*(0.9+row*0.08),fLine);}
+        else if(phase===12){for(let i=0;i<36;i++)add(Math.PI*2*i/36+frameCount*0.03,bs*0.68,fRing);for(let i=0;i<8;i++)add(-frameCount*0.14+i*Math.PI*2/8,bs*0.96,fParticle);}
+        else if(phase===13){for(let i=0;i<10;i++){const a=targetAngle-0.45+i*0.1;add(a,bs*1.04,fTarget);add(a+Math.PI,bs*0.88,fLine);add(a+Math.PI/2,bs*0.74,fParticle);}}
+        else{for(let i=0;i<18;i++)add(frameCount*0.12+i*Math.PI*2/18,bs*0.82,fParticle);for(let i=0;i<18;i++)add(-frameCount*0.12+i*Math.PI*2/18,bs*0.82,fParticle);for(let i=-4;i<=4;i++)add(targetAngle+i*0.11,bs*1.16,fTarget);}
+        return;
+    }
+
+    if (enemy.role === 'zako' && !isLeaderBar) enemy.attackCooldown = ZAKO_ATTACK_COOLDOWN;
+
+    const density=1;
+    for(let densityIndex=0;densityIndex<density;densityIndex++){
+    switch (profile.type) {
+        case 'target': fireTargeting(profile.speed); break;
+        case 'ring':   fireRing(5, profile.speed); break;
+        case 'line':   fireLine(profile.speed); break;
+        case 'fan':    fireFan(3, 0.42, profile.speed); break;
+        case 'spiral': fireSpiral(profile.speed); break;
+        default:       fireTargeting(profile.speed); break;
+    }
+    }
+}
+
+// === 敵のアニメーション・移動ロジック ===
+function updateEnemyAnimation(e) {
+    e.animTimer++;
+    if (e.attackCooldown > 0) e.attackCooldown--;
+
+    // 退場中の場合は移動（待機）モーションを維持しながら左へ退避
+    if (e.animState === 'RETREAT') {
+        e.x -= 5;
+        if (e.animTimer % 8 === 0) {
+            let moveMaxFrame = 3;
+            if (e.id === 2 || e.id === 5 || e.id === 7 || e.id === 9) moveMaxFrame = e.totalFrames;
+            else if (e.id === 3 || e.id === 8) moveMaxFrame = 4;
+            else if (e.id === 4 || e.id === 6) moveMaxFrame = 5;
+            else if (e.id === 10) moveMaxFrame = 6;
+            else if (e.id === 11) moveMaxFrame = 3; // ワカッタTVの待機コマは1〜3コマ目
+            e.frame = (e.frame % moveMaxFrame) + 1;
+        }
+        if (e.x < -200) e.hasRetreated = true;
+        return;
+    }
+
+    // 登場移動
+    if (e.x > e.targetX) {
+        e.x -= e.isBoss ? 1.5 : 3;
+    } else if ([1,7,8,9].includes(e.id)) {
+        e.y = e.baseY + Math.sin(frameCount * 0.05) * 12;
+    } else {
+        e.y = e.baseY;
+    }
+
+    e.baseY = safeEnemyY(e.baseY, e.h);
+    e.y = safeEnemyY(e.y, e.h);
+    if (e.x + e.w > 0 && e.x < canvas.width && e.y + e.h > 0 && e.y < canvas.height) {
+        e.wasVisible = true;
+        e.offscreenFrames = 0;
+    } else if (e.wasVisible) {
+        e.offscreenFrames++;
+        if (e.offscreenFrames > 24) e.hasRetreated = true;
+    }
+
+    // キャラ固有のアニメーション制御
+    switch (e.id) {
+        case 1:
+            if (stage === 2 && e.role === 'zako') {
+                // ステージ2：螺旋＋狙い撃ちの短間隔連射。
+                if (e.animTimer % 8 === 0) e.frame = (e.frame % 3) + 1;
+                if (e.x <= e.targetX && e.animTimer % 12 === 0) {
+                    e.animState = 'ATTACK';
+                    e.frame = 6;
+                    spawnEnemyBullets(e);
+                }
+                break;
+            }
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 3) + 1;
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : (e.role === 'midboss' ? 0.14 : 0.07)) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 6;
+                        spawnEnemyBullets(e);
+                        e.attackDone = true;
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer > (e.role === 'boss' ? 28 : (e.role === 'midboss' ? 24 : 16))) {
+                    e.frame = 1;
+                    e.animState = e.retreatAfterAttack ? 'RETREAT' : 'MOVE';
+                }
+            }
+            break;
+
+        case 2:
+            if (e.animTimer % 8 === 0) e.frame = (e.frame % e.totalFrames) + 1;
+            if (e.animTimer % (e.role === 'boss' ? 38 : (e.role === 'midboss' ? 48 : 78)) === 0 && e.x <= e.targetX) spawnEnemyBullets(e);
+            break;
+
+        case 3:
+            if (stage === 2 && e.role === 'zako') {
+                // ステージ2：螺旋＋扇の連射。
+                if (e.animTimer % 8 === 0) e.frame = (e.frame % 4) + 1;
+                if (e.x <= e.targetX && e.animTimer % 14 === 0) {
+                    e.animState = 'ATTACK';
+                    e.frame = 10;
+                    spawnEnemyBullets(e);
+                }
+                break;
+            }
+            // オトクガエル：待機モーションは1〜4フレーム。
+            // 攻撃開始後は5→6→7→8→9→10と進み、10フレーム目で弾幕を発射。
+            // 発射中は10フレーム目を維持し、終了後に10→9→8→7と逆再生してから1フレームへ戻る。
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 4) + 1;
+                    const attackChance = e.role === 'boss' ? 0.055 : (e.role === 'midboss' ? 0.045 : 0.012);
+                    if (Math.random() < attackChance && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 5;
+                        e.attackDone = false;
+                        e.attackHoldTimer = 0;
+                        e.animTimer = 0;
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.frame < 10 && e.animTimer % 6 === 0) {
+                    e.frame++;
+                    if (e.frame === 10) {
+                        spawnEnemyBullets(e);
+                        e.attackDone = true;
+                        e.attackHoldTimer = 0;
+                    }
+                }
+
+                // 弾幕発射中は最後のフレームを維持。
+                if (e.frame === 10 && e.attackDone) {
+                    e.attackHoldTimer++;
+                    if (e.attackHoldTimer >= 30) {
+                        e.animState = 'REVERSE';
+                        e.animTimer = 0;
+                    }
+                }
+            } else if (e.animState === 'REVERSE') {
+                if (e.animTimer % 6 === 0) {
+                    if (e.frame > 7) {
+                        e.frame--;
+                    } else {
+                        e.frame = 1;
+                        e.animState = 'MOVE';
+                        e.animTimer = 0;
+                    }
+                }
+            }
+            break;
+
+        case 4:
+            if (e.role === 'midboss') {
+                // 中ボスは攻撃開始待ちを廃止し、12フレームごとに高密度弾幕を連射。
+                if (e.animTimer % 8 === 0) e.frame = (e.frame % 5) + 1;
+                if (e.x <= e.targetX && e.animTimer % 12 === 0) {
+                    e.animState = 'ATTACK';
+                    e.frame = 9;
+                    spawnEnemyBullets(e);
+                }
+                if (e.animState === 'ATTACK' && e.animTimer % 48 === 0) {
+                    e.animState = 'MOVE';
+                    e.frame = 1;
+                }
+            } else if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 5) + 1;
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : 0.07) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 9;
+                        spawnEnemyBullets(e);
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer > (e.role === 'boss' ? 28 : 16)) {
+                    e.frame = 1;
+                    e.animState = 'MOVE';
+                }
+            }
+            break;
+
+        case 5:
+            if (stage === 2 && e.role === 'zako') {
+                // ステージ2：リング＋狙い撃ちを一定間隔で連射。
+                if (e.animTimer % 8 === 0) e.frame = (e.frame % e.totalFrames) + 1;
+                if (e.x <= e.targetX && e.animTimer % 16 === 0) spawnEnemyBullets(e);
+                break;
+            }
+            if (e.animTimer % 8 === 0) {
+                e.frame = (e.frame % e.totalFrames) + 1;
+                if (e.frame === 5 && e.x <= e.targetX) spawnEnemyBullets(e);
+            }
+            break;
+
+        case 6:
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 5) + 1;
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : (e.role === 'midboss' ? 0.14 : 0.07)) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 6;
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer % 6 === 0) {
+                    e.frame++;
+                    if (e.frame === 8) spawnEnemyBullets(e);
+                    if (e.frame > 8) {
+                        e.frame = 1;
+                        e.animState = 'MOVE';
+                    }
+                }
+            }
+            break;
+
+        case 7:
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 5) + 1;
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : (e.role === 'midboss' ? 0.14 : 0.07)) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 9;
+                        spawnEnemyBullets(e);
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer > (e.role === 'boss' ? 28 : (e.role === 'midboss' ? 24 : 16))) {
+                    e.frame = 1;
+                    e.animState = 'MOVE';
+                }
+            }
+            break;
+
+        case 8:
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 4) + 1;
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : (e.role === 'midboss' ? 0.14 : 0.07)) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 8;
+                        spawnEnemyBullets(e);
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer > (e.role === 'boss' ? 28 : (e.role === 'midboss' ? 24 : 16))) {
+                    e.frame = 1;
+                    e.animState = 'MOVE';
+                }
+            }
+            break;
+
+        case 9:
+            if (stage === 1 && e.role === 'zako') {
+                // ステージ1のリードバー：停止位置に着いたら弾幕を連射し続ける。
+                if (e.animTimer % 6 === 0) {
+                    e.frame = (e.frame % e.totalFrames) + 1;
+                    if (e.x <= e.targetX) spawnEnemyBullets(e);
+                }
+            } else if (e.animTimer % 8 === 0) {
+                e.frame = (e.frame % e.totalFrames) + 1;
+                if (e.frame === 5 && e.x <= e.targetX) {
+                    spawnEnemyBullets(e);
+                    if (e.retreatAfterAttack) e.animState = 'RETREAT';
+                }
+            }
+            break;
+
+        case 10:
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 6) + 1;
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : (e.role === 'midboss' ? 0.14 : 0.07)) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 9;
+                        spawnEnemyBullets(e);
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer > (e.role === 'boss' ? 28 : (e.role === 'midboss' ? 24 : 16))) {
+                    e.frame = 1;
+                    e.animState = e.retreatAfterAttack ? 'RETREAT' : 'MOVE';
+                }
+            }
+            break;
+
+        case 11:
+            // ワカッタTV (1〜3コマ：待機、5コマ目：攻撃)
+            if (e.animState === 'MOVE') {
+                if (e.animTimer % 8 === 0) {
+                    e.frame = (e.frame % 3) + 1; // 1〜3コマ目をループ
+                    if (Math.random() < (e.role === 'boss' ? 0.18 : (e.role === 'midboss' ? 0.14 : 0.07)) && e.x <= e.targetX) {
+                        e.animState = 'ATTACK';
+                        e.frame = 5; // 5コマ目で攻撃
+                        spawnEnemyBullets(e);
+                    }
+                }
+            } else if (e.animState === 'ATTACK') {
+                if (e.animTimer > (e.role === 'boss' ? 28 : (e.role === 'midboss' ? 24 : 16))) {
+                    e.frame = 1;
+                    e.animState = e.retreatAfterAttack ? 'RETREAT' : 'MOVE';
+                }
+            }
+            break;
+    }
+}
+
+// === 更新処理 ===
+function update() {
+    updateTransition();
+    if (transitionActive) return;
+
+    if (gameState === 'TITLE') {
+        if (!isTitleAnimFinished) {
+            titleAnimTimer += 1; // 現在の速度の0.8倍（1コマ進む間隔を約3.75フレームに調整）
+            if (titleAnimTimer >= 3.75) {
+                titleAnimFrame++;
+                titleAnimTimer -= 3.75;
+                const cfg = SPRITE_CONFIG.titleAnim;
+                if (titleAnimFrame >= cfg.totalFrames) {
+                    titleAnimFrame = cfg.totalFrames;
+                    isTitleAnimFinished = true;
+                    if (!titleUiFadeStarted) {
+                        titleUiFadeStarted = true;
+                        uiFadeProgress = 0;
+                    }
+                }
+            }
+        } else if (input.justPressed['Enter'] || input.justPressed[' '] || input.touch.jump) {
+            setGameState('TUTORIAL_CHOICE');
+        }
+    } else if (gameState === 'HOW_TO_PLAY') {
+        if (input.justPressed['Escape'] || input.justPressed['Backspace'] || input.justPressed['Enter'] || input.justPressed[' ']) {
+            setGameState('TITLE');
+        }
+    } else if (gameState === 'TUTORIAL_CHOICE') {
+        if (input.justPressed['ArrowUp'] || input.justPressed['ArrowLeft']) choiceSelection = 0;
+        if (input.justPressed['ArrowDown'] || input.justPressed['ArrowRight']) choiceSelection = 1;
+        if (input.justPressed['Enter'] || input.justPressed[' ']) { if (choiceSelection === 0) beginTutorial(); else beginStageWithoutTutorial(); }
+    } else if (gameState === 'STAGE_CLEAR') {
+        if (input.justPressed['Enter'] || input.justPressed[' ']) proceedToNextStage();
+    } else if (gameState === 'GAMEOVER') {
+        if (hitCount >= MAX_PLAYER_HP && (input.justPressed['Enter'] || input.justPressed[' '])) restartGame();
+    } else if (gameState === 'PLAYING') {
+        frameCount++;
+        
+        const touchMoveX=input.touch.moveX||0;
+        const zeroGravityCombat = (stage >= 1 && stage <= 3) && /^(STAGE[123]_(MIDBOSS|BOSS))$/.test(waveState) && !tutorialActive;
+        let moveLeft = input.keys['a'] || input.keys['A'] || input.keys['ArrowLeft'] || input.touch.left || touchMoveX < -0.20;
+        let moveRight = input.keys['d'] || input.keys['D'] || input.keys['ArrowRight'] || input.touch.right || touchMoveX > 0.20;
+        let moveUp = input.keys['w'] || input.keys['W'] || input.keys['ArrowUp'];
+        let moveDown = input.keys['s'] || input.keys['S'] || input.keys['ArrowDown'];
+        let doJump = input.keys['w'] || input.keys['W'] || input.keys['ArrowUp'] || input.touch.jump;
+        let currentSpeed = player.speed;
+
+        if (zeroGravityCombat) {
+            // ステージ1～3の中ボス・ボス戦は無重力。WASD / 方向キーで上下左右へ自由移動。
+            if (touchMoveX < -0.20){player.vx=touchMoveX*currentSpeed;player.dir=-1;}
+            else if (touchMoveX > 0.20){player.vx=touchMoveX*currentSpeed;player.dir=1;}
+            else if(moveLeft&&!moveRight){player.vx=-currentSpeed;player.dir=-1;}
+            else if(moveRight&&!moveLeft){player.vx=currentSpeed;player.dir=1;}
+            else {player.vx=0;}
+
+            const verticalInput = (moveDown ? 1 : 0) - (moveUp ? 1 : 0);
+            player.vy = verticalInput * currentSpeed;
+            player.isJumping = false;
+
+            player.x += player.vx;
+            player.y += player.vy;
+            player.x = Math.max(0, Math.min(canvas.width - player.w, player.x));
+            player.y = Math.max(0, Math.min(canvas.height - player.h, player.y));
+            // 無重力の中ボス・ボス戦では自機を常に右向きに固定。
+            player.dir = 1;
+        } else {
+            if(touchMoveX < -0.20){player.vx=touchMoveX*currentSpeed;player.dir=-1;}
+            else if(touchMoveX > 0.20){player.vx=touchMoveX*currentSpeed;player.dir=1;}
+            else if(moveLeft&&!moveRight){player.vx=-currentSpeed;player.dir=-1;}
+            else if(moveRight&&!moveLeft){player.vx=currentSpeed;player.dir=1;}
+            else {player.vx=0;}
+
+            player.vy += 0.5;
+            if (doJump && !player.isJumping) {
+                player.vy = -player.jumpPower;
+                player.isJumping = true;
+            }
+
+            player.x += player.vx;
+            player.y += player.vy;
+            player.x = Math.max(0, Math.min(canvas.width - player.w, player.x));
+
+            // 道路中央にある白い点線（背景画像の高さ64px中、y=56px付近）を地面の基準線にする。
+            const groundLineY = canvas.height * (56 / 64);
+            const groundY = groundLineY - player.h;
+            if (player.y >= groundY) {
+                player.y = groundY;
+                player.vy = 0;
+                player.isJumping = false;
+            }
+            if (player.y < 0) { player.y = 0; player.vy = Math.max(0, player.vy); }
+        }
+
+        if(tutorialActive){
+            if(tutorialStep===0){
+                waveState='TUTORIAL_MOVE';
+                if(player.x>=tutorialStartX+Math.max(120,canvas.width*0.18)){tutorialStep=1;tutorialJumpSeen=false;tutorialJumpLanded=false;waveState='TUTORIAL_JUMP';}
+            }else if(tutorialStep===1){
+                waveState='TUTORIAL_JUMP';
+                if(player.isJumping) tutorialJumpSeen=true;
+                if(tutorialJumpSeen&&!player.isJumping&&player.vy===0) tutorialJumpLanded=true;
+                if(tutorialJumpLanded){tutorialStep=2;tutorialAttackStarted=false;waveState='TUTORIAL_ATTACK';enemies=[];playerBullets=[];enemyBullets=[];spawnTutorialZako();}
+            }else{waveState='TUTORIAL_ATTACK';tutorialAttackStarted=true;}
+        }
+
+        // 空中足場：マップと同じ速度で奥側から左へ流れ続ける
+        // 元素材は64x64px。実際の足場部分40x15pxを比率維持で2.5倍化。
+        const platImg = images.platforms;
+        if (platImg.complete && platImg.naturalWidth > 0) {
+            const cellW = (platImg.naturalWidth / SPRITE_CONFIG.platforms.cols) * PLATFORM_SCALE;
+            const cellH = (platImg.naturalHeight / SPRITE_CONFIG.platforms.rows) * PLATFORM_SCALE;
+
+            platforms.forEach(p => {
+                p.x -= MAP_SCROLL_SPEED;
+                if (p.x < -cellW) {
+                    // 4段×4個の千鳥配置を維持する。
+                    // 同じ段の右端へ一定間隔で戻すことで、各段4個・全体16個を保つ。
+                    const sameRow = platforms.filter(q => q !== p && q.patternRow === p.patternRow);
+                    const rightMost = sameRow.length
+                        ? Math.max(...sameRow.map(q => q.x))
+                        : canvas.width * 0.74;
+                    const spacing = Math.max(cellW * 1.15, canvas.width * 0.24);
+                    p.x = rightMost + spacing;
+                    p.type = stage;
+                    platformSequenceIndex++;
+                }
+            });
+
+            // 足場の実寸矩形を、そのまま1つの当たり判定として使用。
+            // 重力時は「床」、無重力時は「障害物」として同じ矩形判定を維持する。
+            const previousPlayerX = player.x - player.vx;
+            const previousPlayerY = player.y - player.vy;
+
+            platforms.forEach(p => {
+                const platformRect = platformActiveRect(p);
+                const playerLeft = player.x;
+                const playerRight = player.x + player.w;
+                const playerTop = player.y;
+                const playerBottom = player.y + player.h;
+                const previousLeft = previousPlayerX;
+                const previousRight = previousPlayerX + player.w;
+                const previousTop = previousPlayerY;
+                const previousBottom = previousPlayerY + player.h;
+
+                const overlaps =
+                    playerRight > platformRect.x &&
+                    playerLeft < platformRect.x + platformRect.w &&
+                    playerBottom > platformRect.y &&
+                    playerTop < platformRect.y + platformRect.h;
+
+                if (!overlaps) return;
+
+                // 移動方向を優先して衝突面を決定する。
+                // 無重力中もここを通るため、足場はそのまま障害物になる。
+                if (player.vy > 0 && previousBottom <= platformRect.y) {
+                    player.y = platformRect.y - player.h;
+                    player.vy = 0;
+                    player.isJumping = false;
+                    return;
+                }
+
+                if (player.vy < 0 && previousTop >= platformRect.y + platformRect.h) {
+                    player.y = platformRect.y + platformRect.h;
+                    player.vy = 0;
+                    return;
+                }
+
+                if (player.vx > 0 && previousRight <= platformRect.x) {
+                    player.x = platformRect.x - player.w;
+                    player.vx = 0;
+                    return;
+                }
+
+                if (player.vx < 0 && previousLeft >= platformRect.x + platformRect.w) {
+                    player.x = platformRect.x + platformRect.w;
+                    player.vx = 0;
+                    return;
+                }
+
+                // フレーム間で大きくめり込んだ場合の保険。
+                // 最も浅い方向へ押し戻して、足場内部に残らないようにする。
+                const pushLeft = playerRight - platformRect.x;
+                const pushRight = platformRect.x + platformRect.w - playerLeft;
+                const pushTop = playerBottom - platformRect.y;
+                const pushBottom = platformRect.y + platformRect.h - playerTop;
+                const minPush = Math.min(pushLeft, pushRight, pushTop, pushBottom);
+
+                if (minPush === pushTop) {
+                    player.y = platformRect.y - player.h;
+                    player.vy = 0;
+                    player.isJumping = false;
+                } else if (minPush === pushBottom) {
+                    player.y = platformRect.y + platformRect.h;
+                    player.vy = 0;
+                } else if (minPush === pushLeft) {
+                    player.x = platformRect.x - player.w;
+                    player.vx = 0;
+                } else {
+                    player.x = platformRect.x + platformRect.w;
+                    player.vx = 0;
+                }
+            });
+        }
+
+        // プレイヤーアニメ
+        if (frameCount % 5 === 0) {
+            if (player.isJumping) {
+                const jCfg = SPRITE_CONFIG.playerJump;
+                player.animFrame = (player.animFrame % jCfg.totalFrames) + 1;
+            } else if (player.vx !== 0) {
+                // 歩行中は2→3→2→3と交互に切り替え、足が開いたまま固定されないようにする。
+                player.animFrame = player.animFrame === 2 ? 3 : 2;
+            } else {
+                player.animFrame = 1;
+            }
+        }
+
+        // ショット
+        player.shootTimer++;
+        if (player.shootTimer > 6) {
+            playerBullets.push({
+                x: player.x + player.w/2, 
+                y: player.y + player.h * 0.5,
+                vx: 16 * player.dir, 
+                vy: 0
+            });
+            player.shootTimer = 0;
+        }
+
+        // 敵のアニメ更新＆処理
+        enemies.forEach(e => updateEnemyAnimation(e));
+
+        // プレイヤー弾に弱いホーミングを付与。近い敵へ少しずつ向きを補正する。
+        playerBullets.forEach(b => {
+            if (enemies.length) {
+                let target = null;
+                let bestD2 = Infinity;
+                const currentAngle = Math.atan2(b.vy, b.vx);
+                for (const e of enemies) {
+                    const tx = e.x + e.w * 0.5;
+                    const ty = e.y + e.h * 0.5;
+                    const dx = tx - b.x;
+                    const dy = ty - b.y;
+                    const d2 = dx * dx + dy * dy;
+                    // 近すぎない/遠すぎない範囲で、基本的に弾の進行方向側を優先
+                    const forward = dx * player.dir;
+                    if (forward < -80 || d2 > 520 * 520) continue;
+                    if (d2 < bestD2) { bestD2 = d2; target = e; }
+                }
+                if (target) {
+                    const tx = target.x + target.w * 0.5;
+                    const ty = target.y + target.h * 0.5;
+                    const targetAngle = Math.atan2(ty - b.y, tx - b.x);
+                    let diff = targetAngle - currentAngle;
+                    while (diff > Math.PI) diff -= Math.PI * 2;
+                    while (diff < -Math.PI) diff += Math.PI * 2;
+                    const turnRate = 0.018; // 弱めの追尾
+                    const turn = Math.max(-turnRate, Math.min(turnRate, diff));
+                    const nextAngle = currentAngle + turn;
+                    const speed = Math.max(12, Math.hypot(b.vx, b.vy));
+                    b.vx = Math.cos(nextAngle) * speed;
+                    b.vy = Math.sin(nextAngle) * speed;
+                }
+            }
+            b.x += b.vx;
+            b.y += b.vy;
+        });
+        enemyBullets.forEach(b => { b.x += b.vx; b.y += b.vy; });
+
+        // 当たり判定: 自機攻撃 vs 敵
+        playerBullets.forEach((pb, pIndex) => {
+            enemies.forEach((e) => {
+                if (pb.x > e.x && pb.x < e.x + e.w && pb.y > e.y && pb.y < e.y + e.h) {
+                    e.hp -= 1;
+                    playerBullets.splice(pIndex, 1);
+                    if (e.hp <= 0 && e.isBoss) e.animState = 'RETREAT';
+                }
+            });
+        });
+
+        enemies = enemies.filter(e => e.hp > 0 && !e.hasRetreated);
+
+        // ステージ進行制御
+        if (enemies.length === 0) {
+            playerBullets = [];
+            enemyBullets = [];
+
+            if (tutorialActive) {
+                if(tutorialStep===2){tutorialActive=false;tutorialComplete=true;startStage(1);}
+            } else if (stage === 1) {
+                switch (waveState) {
+                    case 'STAGE1_ZAKO1':
+                        stage1PhaseIndex = 1;
+                        spawnStage1Zako2();
+                        break;
+                    case 'STAGE1_ZAKO2':
+                        stage1PhaseIndex = 2;
+                        spawnStage1MidBoss();
+                        break;
+                    case 'STAGE1_MIDBOSS':
+                        stage1PhaseIndex = 3;
+                        spawnStage1Zako3();
+                        break;
+                    case 'STAGE1_ZAKO3':
+                        stage1PhaseIndex = 4;
+                        spawnStage1Boss();
+                        break;
+                    case 'STAGE1_BOSS':
+                        setGameState('STAGE_CLEAR'); stageClearSelection=0; clearTimeMs=performance.now()-gameStartTime;
+                        break;
+                }
+            } else if (stage === 2) {
+                switch (waveState) {
+                    case 'STAGE2_ZAKO1':
+                        spawnStage2Zako2();
+                        break;
+                    case 'STAGE2_ZAKO2':
+                        spawnStage2MidBoss();
+                        break;
+                    case 'STAGE2_MIDBOSS':
+                        spawnStage2Zako3();
+                        break;
+                    case 'STAGE2_ZAKO3':
+                        spawnStage2Boss();
+                        break;
+                    case 'STAGE2_BOSS':
+                        setGameState('STAGE_CLEAR'); stageClearSelection=0; clearTimeMs=performance.now()-gameStartTime;
+                        break;
+                }
+            } else if (stage === 3) {
+                switch (waveState) {
+                    case 'STAGE3_ZAKO1':
+                        spawnStage3Zako2();
+                        break;
+                    case 'STAGE3_ZAKO2':
+                        spawnStage3MidBoss();
+                        break;
+                    case 'STAGE3_MIDBOSS':
+                        spawnStage3Zako3();
+                        break;
+                    case 'STAGE3_ZAKO3':
+                        spawnStage3Boss();
+                        break;
+                    case 'STAGE3_BOSS':
+                        setGameState('STAGE_CLEAR'); stageClearSelection=0; clearTimeMs=performance.now()-gameStartTime;
+                        break;
+                }
+            }
+        }
+
+        // 当たり判定：敵弾 vs プレイヤー
+        // プレイヤー本体の90x120全体ではなく、「自機.png」だけを当たり判定に使う。
+        // 自機.pngの透明部分を除いた外接四角形を、実際の描画サイズへ対応させる。
+        const playerHitbox = getPlayerHitboxRect();
+        enemyBullets.forEach((b, i) => {
+            const overlaps =
+                b.x > playerHitbox.x &&
+                b.x < playerHitbox.x + playerHitbox.w &&
+                b.y > playerHitbox.y &&
+                b.y < playerHitbox.y + playerHitbox.h;
+            if (!debugMode && overlaps && performance.now() >= playerInvincibleUntil) {
+                hitCount++;
+                playerInvincibleUntil = performance.now() + 1000;
+                enemyBullets.splice(i, 1);
+                if (hitCount >= MAX_PLAYER_HP) setGameState('GAMEOVER');
+            }
+        });
+
+        playerBullets = playerBullets.filter(b => b.x > 0 && b.x < canvas.width);
+        enemyBullets = enemyBullets.filter(b => b.x > -100 && b.x < canvas.width + 100 && b.y > -100 && b.y < canvas.height + 100);
+
+
+    }
+}
+
+function drawDebugOverlay() {
+    if (!debugMode) return;
+
+    const visiblePlatforms = getVisiblePlatformCount();
+    const zeroGravityCombat = (stage >= 1 && stage <= 3) && /^(STAGE[123]_(MIDBOSS|BOSS))$/.test(waveState) && !tutorialActive;
+    const rows = [
+        'DEBUG MODE  [F3で切替]',
+        `Stage: ${stage}  /  Wave: ${waveState}`,
+        `足場: ${visiblePlatforms} / ${TARGET_VISIBLE_PLATFORMS}  (総数 ${platforms.length})`,
+        `Player: x=${player.x.toFixed(1)}  y=${player.y.toFixed(1)}`,
+        `Velocity: vx=${player.vx.toFixed(2)}  vy=${player.vy.toFixed(2)}`,
+        `状態: ${zeroGravityCombat ? '無重力' : '重力'}  /  被弾 ${hitCount}/${MAX_PLAYER_HP}`,
+        `Speed: x${gameSpeedMultiplier}  /  無敵: ${debugMode ? 'ON' : 'OFF'}`,
+        `Enemies: ${enemies.length}  /  PlayerBullets: ${playerBullets.length}  /  EnemyBullets: ${enemyBullets.length}`
+    ];
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    const panelW = Math.min(430, canvas.width - 20);
+    const panelH = 24 + rows.length * 22;
+    ctx.fillRect(10, 92, panelW, panelH);
+    ctx.font = '16px GameFont, sans-serif';
+    ctx.textAlign = 'left';
+    rows.forEach((row, i) => {
+        ctx.fillStyle = i === 0 ? '#ffff00' : '#ffffff';
+        ctx.fillText(row, 20, 115 + i * 22);
+    });
+
+    // 当たり判定を可視化。
+    platforms.forEach(p => {
+        const r = platformActiveRect(p);
+        if (r.x + r.w <= 0 || r.x >= canvas.width || r.y + r.h <= 0 || r.y >= canvas.height) return;
+        ctx.strokeStyle = '#00ff66';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(r.x, r.y, r.w, r.h);
+    });
+
+    const playerHitbox = getPlayerHitboxRect();
+    ctx.strokeStyle = '#ff3300';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(playerHitbox.x, playerHitbox.y, playerHitbox.w, playerHitbox.h);
+
+    enemies.forEach(e => {
+        const ex = Math.max(0, Math.min(canvas.width - e.w, e.x));
+        const ey = Math.max(0, Math.min(canvas.height - e.h, e.y));
+        ctx.strokeStyle = e.isBoss ? '#ff00ff' : '#00aaff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(ex, ey, e.w, e.h);
+    });
+
+    ctx.restore();
+}
+
+// === 描画処理 ===
+function draw() {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.imageSmoothingEnabled = false;
+
+    if (imagesLoaded < totalImages) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '20px GameFont, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Loading...', canvas.width/2, canvas.height/2);
+        return;
+    }
+
+    if (gameState === 'TITLE') {
+        const cfg = SPRITE_CONFIG.titleAnim;
+        if (images.titleAnim.complete && images.titleAnim.naturalWidth > 0) {
+            const sw = images.titleAnim.naturalWidth / cfg.cols;
+            const sh = images.titleAnim.naturalHeight / cfg.rows;
+            const idx = titleAnimFrame - 1;
+            // 枠外へのはみ出しを防ぐため、coverではなくcontainで全コマを画面内へ収める。
+            const scale = Math.min(canvas.width / sw, canvas.height / sh) * 0.96;
+            const dw = sw * scale, dh = sh * scale;
+            const dx = Math.round((canvas.width - dw) / 2);
+            const dy = Math.round((canvas.height - dh) / 2);
+            ctx.drawImage(images.titleAnim, (idx % cfg.cols) * sw, Math.floor(idx / cfg.cols) * sh, sw, sh, dx, dy, dw, dh);
+        }
+        
+        if (isTitleAnimFinished) {
+            ctx.save();
+            ctx.globalAlpha = easeOutCubic(uiFadeProgress);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#dc8c39';
+            const titleSize = Math.min(60, canvas.width * 0.11, canvas.height * 0.09);
+            ctx.font = `${titleSize}px GameFont, sans-serif`;
+            const titleY = Math.max(titleSize + 8, Math.min(canvas.height * 0.40, canvas.height - 155));
+            ctx.fillText('ykkr', canvas.width / 2, titleY);
+            const r = getTitleButtonRect();
+            ctx.fillStyle = '#dc8c39'; ctx.fillRect(r.bx, r.by, r.bw, r.bh);
+            ctx.fillStyle = '#000000'; ctx.font = `${Math.min(26, r.bh * 0.48)}px GameFont, sans-serif`;
+            ctx.fillText('START', canvas.width / 2, r.by + r.bh * 0.65);
+
+            const hr = getHowToButtonRect();
+            ctx.fillStyle = '#ffffff'; ctx.fillRect(hr.bx, hr.by, hr.bw, hr.bh);
+            ctx.fillStyle = '#000000'; ctx.font = `${Math.min(24, hr.bh * 0.44)}px GameFont, sans-serif`;
+            ctx.fillText('遊び方', canvas.width / 2, hr.by + hr.bh * 0.65);
+            ctx.font = `${Math.min(15, canvas.height * 0.024)}px GameFont, sans-serif`; ctx.fillStyle = '#000';
+            ctx.fillText('Enter / クリックでSTART・「遊び方」で説明を見る', canvas.width / 2, Math.min(canvas.height - 10, hr.by + hr.bh + 24));
+            ctx.restore();
+        }
+
+    } else if (gameState === 'HOW_TO_PLAY') {
+        ctx.fillStyle='#000';
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.save();
+        ctx.globalAlpha = easeOutCubic(uiFadeProgress);
+        ctx.textAlign='center';
+
+        const isSmall = canvas.height < 700 || canvas.width < 700;
+        const titleY = isSmall ? canvas.height*0.09 : canvas.height*0.08;
+        ctx.fillStyle='#dc8c39';
+        ctx.font=`${Math.min(42,canvas.width*0.07)}px GameFont, sans-serif`;
+        ctx.fillText('遊び方',canvas.width/2,titleY);
+
+        const left = Math.max(22, canvas.width*0.07);
+        const right = canvas.width-left;
+        const top = isSmall ? canvas.height*0.16 : canvas.height*0.15;
+        const lineGap = isSmall ? 27 : 31;
+        let y = top;
+        ctx.textAlign='left';
+        ctx.fillStyle='#dc8c39';
+        ctx.font=`${Math.min(23,canvas.width*0.038)}px GameFont, sans-serif`;
+        ctx.fillText('■ 基本操作',left,y); y += lineGap;
+        ctx.fillStyle='#fff';
+        ctx.font=`${Math.min(17,canvas.width*0.028)}px GameFont, sans-serif`;
+        ctx.fillText('PC：A / D・← / → で左右移動　　W / ↑ でジャンプ',left,y); y += lineGap;
+        ctx.fillText('スマホ・iPad：左スティックで移動　右の JUMP でジャンプ',left,y); y += lineGap*1.18;
+
+        ctx.fillStyle='#dc8c39';
+        ctx.font=`${Math.min(23,canvas.width*0.038)}px GameFont, sans-serif`;
+        ctx.fillText('■ 攻撃',left,y); y += lineGap;
+        ctx.fillStyle='#fff';
+        ctx.font=`${Math.min(17,canvas.width*0.028)}px GameFont, sans-serif`;
+        ctx.fillText('攻撃は自動です。自機が向いている方向へ弾を発射します。',left,y); y += lineGap*1.18;
+
+        ctx.fillStyle='#dc8c39';
+        ctx.font=`${Math.min(23,canvas.width*0.038)}px GameFont, sans-serif`;
+        ctx.fillText('■ 重力と無重力',left,y); y += lineGap;
+        ctx.fillStyle='#fff';
+        ctx.font=`${Math.min(17,canvas.width*0.028)}px GameFont, sans-serif`;
+        ctx.fillText('雑魚戦：通常の重力があります。足場を使って進みます。',left,y); y += lineGap;
+        ctx.fillText('中ボス戦：無重力。W / ↑・S / ↓・A / ←・D / → で上下左右に自由移動。',left,y); y += lineGap;
+        ctx.fillText('ボス戦：無重力。同じく上下左右に自由移動できます。',left,y); y += lineGap;
+        ctx.fillText('※ステージ1・2・3の「中ボス」と「ボス」の戦闘中は無重力です。',left,y); y += lineGap;
+        ctx.fillText('※無重力中は自機が常に右向きに固定されます。',left,y); y += lineGap*1.18;
+
+        ctx.fillStyle='#dc8c39';
+        ctx.font=`${Math.min(23,canvas.width*0.038)}px GameFont, sans-serif`;
+        ctx.fillText('■ 足場とミス',left,y); y += lineGap;
+        ctx.fillStyle='#fff';
+        ctx.font=`${Math.min(17,canvas.width*0.028)}px GameFont, sans-serif`;
+        ctx.fillText('足場の上に着地して、上へ進みましょう。道路まで落ちても復帰できます。',left,y); y += lineGap;
+        ctx.fillText(`被弾できる回数は ${MAX_PLAYER_HP} 回です。上限に達するとゲームオーバーです。`,left,y);
+
+        const br=getHowToBackButtonRect();
+        ctx.fillStyle='#dc8c39';
+        ctx.fillRect(br.bx,br.by,br.bw,br.bh);
+        ctx.textAlign='center';
+        ctx.fillStyle='#000';
+        ctx.font=`${Math.min(24,br.bh*0.44)}px GameFont, sans-serif`;
+        ctx.fillText('戻る',canvas.width/2,br.by+br.bh*0.65);
+        ctx.fillStyle='#fff';
+        ctx.font=`${Math.min(15,canvas.width*0.024)}px GameFont, sans-serif`;
+        ctx.fillText('Enter / Space / Escape / クリックで戻る',canvas.width/2,Math.min(canvas.height-8,br.by+br.bh+22));
+        ctx.restore();
+    } else if (gameState === 'TUTORIAL_CHOICE') {
+        ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.save();
+        ctx.globalAlpha = easeOutCubic(uiFadeProgress);
+        ctx.textAlign='center';
+        ctx.fillStyle='#dc8c39';ctx.font=`${Math.min(44,canvas.width*0.07)}px GameFont, sans-serif`;
+        ctx.fillText('チュートリアルを開始しますか？',canvas.width/2,canvas.height*0.26);
+        ctx.fillStyle='#fff';ctx.font=`${Math.min(20,canvas.width*0.035)}px GameFont, sans-serif`;
+        ctx.fillText('移動・ジャンプ・攻撃を実際に操作して学びます',canvas.width/2,canvas.height*0.32);
+        const rs=getChoiceRects(), opts=['チュートリアルを開始','スキップしてステージ1へ'];
+        opts.forEach((label,i)=>{const r=rs[i];ctx.fillStyle=choiceSelection===i?'#dc8c39':'#555';ctx.fillRect(r.bx,r.by,r.bw,r.bh);ctx.fillStyle='#000';ctx.font=`${Math.min(25,r.bh*0.42)}px GameFont, sans-serif`;ctx.fillText((choiceSelection===i?'▶ ':'')+label,canvas.width/2,r.by+r.bh*0.62);});
+        ctx.fillStyle='#fff';ctx.font=`${Math.min(18,canvas.width*0.032)}px GameFont, sans-serif`;ctx.fillText('↑↓ / ←→で選択・Enterで決定',canvas.width/2,canvas.height*0.82);
+        ctx.restore();
+    } else if (gameState === 'STAGE_CLEAR') {
+        ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.save();
+        ctx.globalAlpha = easeOutCubic(uiFadeProgress);
+        ctx.textAlign='center';
+        ctx.fillStyle='#ffff00';ctx.font=`${Math.min(82,canvas.width*0.13)}px GameFont, sans-serif`;ctx.fillText('Stage Clear!',canvas.width/2,canvas.height*0.36);
+        ctx.fillStyle='#fff';ctx.font=`${Math.min(26,canvas.width*0.04)}px GameFont, sans-serif`;ctx.fillText(`Stage ${stage} クリア`,canvas.width/2,canvas.height*0.47);
+        const r=getStageClearButtonRect();ctx.fillStyle='#dc8c39';ctx.fillRect(r.bx,r.by,r.bw,r.bh);ctx.fillStyle='#000';ctx.font=`${Math.min(28,r.bh*0.42)}px GameFont, sans-serif`;ctx.fillText(stage < 3 ? '次のステージへ' : 'ゲーム終了',canvas.width/2,r.by+r.bh*0.62);
+        ctx.fillStyle='#fff';ctx.font=`${Math.min(18,canvas.width*0.032)}px GameFont, sans-serif`;ctx.fillText('Enter / クリックで決定',canvas.width/2,r.by+r.bh+34);
+        ctx.restore();
+    } else if (gameState === 'PLAYING') {
+        // 背景
+        let bgImg = images.bgAll;
+        if (bgImg.complete && bgImg.naturalWidth > 0) {
+            const bgSourceW = bgImg.naturalWidth;
+            const bgSourceH = bgImg.naturalHeight / 3;
+            const bgStageIndex = stage - 1;
+            const bgSy = bgStageIndex * bgSourceH;
+            const bgScale = canvas.height / bgSourceH;
+            const tileW = bgSourceW * bgScale;
+            const bgScrollSpeed = MAP_SCROLL_SPEED;
+            const bgX = -((frameCount * bgScrollSpeed) % tileW);
+            ctx.drawImage(bgImg, 0, bgSy, bgSourceW, bgSourceH, bgX, 0, tileW, canvas.height);
+            ctx.drawImage(bgImg, 0, bgSy, bgSourceW, bgSourceH, bgX + tileW, 0, tileW, canvas.height);
+            if (bgX + tileW < canvas.width) {
+                ctx.drawImage(bgImg, 0, bgSy, bgSourceW, bgSourceH, bgX + tileW * 2, 0, tileW, canvas.height);
+            }
+        }
+
+        // 地面の白線は背景画像に描かれている道路中央の白い点線をそのまま使用。
+
+        // 空中足場：素材1コマの縦横比を維持したまま2.5倍（160x160）で描画。実際の足場部分も比例拡大。
+        const platCfg = SPRITE_CONFIG.platforms;
+        const platImg = images.platforms;
+        platforms.forEach(p => {
+            if (platImg.complete && platImg.naturalWidth > 0) {
+                drawSprite(platImg, platCfg.cols, platCfg.rows, p.type, p.x, p.y, PLATFORM_CELL_SIZE, PLATFORM_CELL_SIZE);
+            }
+        });
+
+        // 敵＆HPバー
+        enemies.forEach(e => {
+            let img = images[e.cfgKey];
+            if (img && img.complete) {
+                const drawX=Math.max(0,Math.min(canvas.width-e.w,e.x));
+                const drawY=Math.max(0,Math.min(canvas.height-e.h,e.y));
+                drawSprite(img,e.cols,e.rows,e.frame,drawX,drawY,e.w,e.h);
+                if(e.isBoss){
+                    const cx=drawX+e.w/2, cy=drawY+e.h/2;
+                    const radius = Math.max(e.w, e.h) * 0.7;
+                    const hpRatio = Math.max(0, e.hp / e.maxHp);
+
+                    ctx.save();
+                    ctx.lineWidth = 5;
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * hpRatio));
+                    ctx.strokeStyle = hpRatio > 0.3 ? '#00ff66' : '#ff3300';
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+        });
+
+        // 自機弾
+        playerBullets.forEach(b => {
+            const bCfg = SPRITE_CONFIG.bullets;
+            let angle = Math.atan2(b.vy, b.vx) + Math.PI / 2;
+            drawRotatedSprite(images.bullets, bCfg.cols, bCfg.rows, 17, b.x, b.y, 36, 36, angle);
+        });
+
+        // プレイヤー表示
+        let pImg = player.isJumping ? images.playerJump : images.playerWalk;
+        let pCfg = player.isJumping ? SPRITE_CONFIG.playerJump : SPRITE_CONFIG.playerWalk;
+        let flip = player.dir === -1;
+        
+        ctx.save();
+        drawSprite(pImg, pCfg.cols, pCfg.rows, player.animFrame, player.x, player.y, player.w, player.h, flip);
+        ctx.restore();
+
+        // 自機：プレイヤーより前面に表示（当たり判定もこの自機.pngのみを基準にする）
+        const hitboxImg = images.hitbox;
+        if (hitboxImg.complete && hitboxImg.naturalWidth > 0) {
+            const hbMaxSize = 44;
+            const hbScale = Math.min(hbMaxSize / hitboxImg.naturalWidth, hbMaxSize / hitboxImg.naturalHeight);
+            const hbW = hitboxImg.naturalWidth * hbScale;
+            const hbH = hitboxImg.naturalHeight * hbScale;
+            const centerX = player.x + player.w * 0.5;
+            const bodyCenterY = player.y + player.h * 0.6;
+
+            ctx.save();
+            ctx.drawImage(hitboxImg, centerX - hbW / 2, bodyCenterY - hbH / 2, hbW, hbH);
+            ctx.restore();
+        }
+
+        // 敵弾レイヤー：プレイヤーより前面に描画する。
+        enemyBullets.forEach(b => {
+            const bCfg = SPRITE_CONFIG.bullets;
+            const frame = b.frame || 1;
+            const col = ((frame - 1) % bCfg.cols) + 1; 
+            
+            let angle = 0;
+            if (col === 1 || col === 4) {
+                angle = Math.atan2(b.vy, b.vx) + Math.PI / 2;
+            } else if (col === 2) {
+                angle = 0;
+            } else if (col === 3) {
+                angle = Math.atan2(b.vy, b.vx) - Math.PI / 2;
+            }
+
+            drawRotatedSprite(images.bullets, bCfg.cols, bCfg.rows, frame, b.x, b.y, 36, 36, angle);
+        });
+
+        // UI表示
+        ctx.fillStyle = '#fff';
+        ctx.font = '22px GameFont, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`被弾数: ${hitCount} / ${MAX_PLAYER_HP}`, 20, 35);
+        
+        let phaseText = `Stage: ${stage}`;
+        if (tutorialActive) phaseText = 'チュートリアル：移動・ジャンプで敵を倒そう（攻撃は自動）';
+        else {
+            const labels = {
+                'STAGE1_ZAKO1': 'Stage 1　雑魚戦1',
+                'STAGE1_ZAKO2': 'Stage 1　雑魚戦2',
+                'STAGE1_MIDBOSS': 'Stage 1　中ボス　【HIGH】',
+                'STAGE1_ZAKO3': 'Stage 1　雑魚戦3',
+                'STAGE1_BOSS': 'Stage 1　ボス　【VERY HIGH】',
+                'STAGE2_ZAKO1': 'Stage 2　雑魚戦1',
+                'STAGE2_ZAKO2': 'Stage 2　雑魚戦2',
+                'STAGE2_MIDBOSS': 'Stage 2　中ボス　【HIGH】',
+                'STAGE2_ZAKO3': 'Stage 2　雑魚戦3',
+                'STAGE2_BOSS': 'Stage 2　ボス　【VERY HIGH】',
+                'STAGE3_ZAKO1': 'Stage 3　雑魚戦1',
+                'STAGE3_ZAKO2': 'Stage 3　雑魚戦2',
+                'STAGE3_MIDBOSS': 'Stage 3　中ボス　【HIGH】',
+                'STAGE3_ZAKO3': 'Stage 3　雑魚戦3',
+                'STAGE3_BOSS': 'Stage 3　ボス　【VERY HIGH】'
+            };
+            phaseText = labels[waveState] || `Stage ${stage}`;
+        }
+        ctx.fillText(phaseText, 20, 70);
+        // iPad / スマホ：左スティックで移動、右ボタンでジャンプ
+        const joyX=Math.min(110,canvas.width*0.16), joyY=canvas.height-92;
+        const joyR=Math.min(70,Math.max(48,canvas.width*0.075));
+        const jumpX=canvas.width-Math.min(88,canvas.width*0.13), jumpY=canvas.height-92;
+        const jumpR=Math.min(58,Math.max(44,canvas.width*0.065));
+        ctx.globalAlpha=0.38;ctx.fillStyle='#dc8c39';ctx.beginPath();ctx.arc(joyX,joyY,joyR,0,Math.PI*2);ctx.fill();
+        ctx.globalAlpha=0.65;ctx.beginPath();ctx.arc(joyX,joyY,joyR*0.38,0,Math.PI*2);ctx.fill();
+        ctx.globalAlpha=0.42;ctx.beginPath();ctx.arc(jumpX,jumpY,jumpR,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;ctx.fillStyle='#000';ctx.textAlign='center';
+        ctx.font=`${Math.min(26,canvas.width*0.05)}px GameFont, sans-serif`;ctx.fillText('移動',joyX,joyY+8);ctx.fillText('JUMP',jumpX,jumpY+8);
+        if(tutorialActive){
+            const panelW=Math.min(760,canvas.width*0.88),panelH=Math.min(165,canvas.height*0.25),panelX=(canvas.width-panelW)/2,panelY=Math.min(26,canvas.height*0.045);
+            ctx.fillStyle='rgba(0,0,0,0.78)';ctx.fillRect(panelX,panelY,panelW,panelH);ctx.textAlign='center';ctx.fillStyle='#dc8c39';ctx.font=`${Math.min(30,canvas.width*0.052)}px GameFont, sans-serif`;
+            ctx.fillText('チュートリアル　'+(['1 / 3　移動','2 / 3　ジャンプ','3 / 3　攻撃'][tutorialStep]||''),canvas.width/2,panelY+36);ctx.fillStyle='#fff';ctx.font=`${Math.min(21,canvas.width*0.034)}px GameFont, sans-serif`;
+            if(tutorialStep===0){ctx.fillText('PC：A / D または ← / →　　スマホ・iPad：左のスティック',canvas.width/2,panelY+78);ctx.fillText('右へ移動して次の説明に進もう',canvas.width/2,panelY+112);}
+            else if(tutorialStep===1){ctx.fillText('PC：W / ↑　　スマホ・iPad：右の JUMP ボタン',canvas.width/2,panelY+78);ctx.fillText('ジャンプして着地すると次へ進みます',canvas.width/2,panelY+112);}
+            else{ctx.fillText('攻撃は自動です。敵の方向を向いて攻撃を当てよう',canvas.width/2,panelY+78);ctx.fillText('敵を倒したらチュートリアル完了！',canvas.width/2,panelY+112);}
+            ctx.fillStyle='#ffff00';ctx.font=`${Math.min(16,canvas.width*0.028)}px GameFont, sans-serif`;ctx.fillText('※チュートリアル中はスキップできません',canvas.width/2,panelY+142);
+        }
+
+        drawDebugOverlay();
+
+    } else if (gameState === 'GAMEOVER') {
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.globalAlpha = easeOutCubic(uiFadeProgress);
+        ctx.fillStyle = '#dc8c39';
+        ctx.font = '50px GameFont, sans-serif';
+        ctx.textAlign = 'center';
+        if (hitCount >= MAX_PLAYER_HP) {
+            ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2 - 42);
+            const restartRect = getGameOverRestartButtonRect();
+            ctx.fillStyle = '#dc8c39';
+            ctx.fillRect(restartRect.bx, restartRect.by, restartRect.bw, restartRect.bh);
+            ctx.fillStyle = '#000000';
+            ctx.font = `${Math.min(28, restartRect.bh * 0.44)}px GameFont, sans-serif`;
+            ctx.fillText('リスタート', canvas.width/2, restartRect.by + restartRect.bh * 0.63);
+            ctx.fillStyle = '#fff';
+            ctx.font = `${Math.min(18, canvas.width * 0.032)}px GameFont, sans-serif`;
+            ctx.fillText('Enter / クリックでリスタート', canvas.width/2, restartRect.by + restartRect.bh + 30);
+        } else {
+            ctx.fillText('CLEAR', canvas.width/2, canvas.height/2 - 60);
+            ctx.font = '26px GameFont, sans-serif';
+            ctx.fillText(`TIME  ${Math.floor(clearTimeMs / 60000)}:${String(Math.floor(clearTimeMs / 1000) % 60).padStart(2,'0')}`, canvas.width/2, canvas.height/2);
+            ctx.fillText(`被弾数  ${hitCount}`, canvas.width/2, canvas.height/2 + 48);
+        }
+        ctx.restore();
+    }
+
+    // 画面遷移用の暗転。完全な黒を一度挟んでから次の画面へ。
+    if (transitionActive && transitionAlpha > 0) {
+        ctx.save();
+        ctx.fillStyle = '#000000';
+        ctx.globalAlpha = transitionAlpha;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+    }
+}
+
+// プレイヤーの被弾判定は「自機」部分だけを対象にした固定矩形。
+// 画像のピクセル解析（getImageData）は、ローカルHTML環境では
+// canvasのセキュリティ制限でフリーズ原因になるため使用しない。
+const PLAYER_HITBOX_WIDTH = 28;
+const PLAYER_HITBOX_HEIGHT = 64;
+const PLAYER_HITBOX_CENTER_X = 0.50;
+const PLAYER_HITBOX_CENTER_Y = 0.56;
+
+function getPlayerHitboxRect() {
+    const centerX = player.x + player.w * PLAYER_HITBOX_CENTER_X;
+    const centerY = player.y + player.h * PLAYER_HITBOX_CENTER_Y;
+    return {
+        x: centerX - PLAYER_HITBOX_WIDTH / 2,
+        y: centerY - PLAYER_HITBOX_HEIGHT / 2,
+        w: PLAYER_HITBOX_WIDTH,
+        h: PLAYER_HITBOX_HEIGHT
+    };
+}
+
+function platformActiveRect(p) {
+    return {
+        x: p.x + (PLATFORM_CELL_SIZE - PLATFORM_ACTIVE_W) / 2,
+        y: p.y + PLATFORM_ACTIVE_OFFSET_Y,
+        w: PLATFORM_ACTIVE_W,
+        h: PLATFORM_ACTIVE_H
+    };
+}
+
+function platformRectsOverlap(a, b, gap = PLATFORM_MIN_GAP) {
+    const ar = platformActiveRect(a);
+    const br = platformActiveRect(b);
+    return (
+        ar.x - gap < br.x + br.w &&
+        ar.x + ar.w + gap > br.x &&
+        ar.y - gap < br.y + br.h &&
+        ar.y + ar.h + gap > br.y
+    );
+}
+
+function getVisiblePlatformCount(cellW = PLATFORM_CELL_SIZE) {
+    return platforms.filter(p => p.x + cellW > 0 && p.x < canvas.width).length;
+}
+
+function normalizePlatformConveyor(cellW = PLATFORM_CELL_SIZE, cellH = PLATFORM_CELL_SIZE) {
+    const spacing = (canvas.width + cellW) / TARGET_VISIBLE_PLATFORMS;
+    const ordered = [...platforms].sort((a, b) => a.x - b.x);
+    platforms = [];
+    ordered.forEach((p, index) => {
+        p.x = index * spacing;
+        p.y = findNonOverlappingPlatformY(p.x, p.y, p, cellH);
+        platforms.push(p);
+    });
+}
+
+function findNonOverlappingPlatformY(x, preferredY, movingPlatform, cellH) {
+    const minY = 24;
+    const maxY = Math.max(minY, canvas.height - cellH - 54);
+
+    // まず希望位置、その周辺をランダム探索し、既存足場と重ならない高さを探す。
+    const candidates = [preferredY];
+    for (let i = 0; i < 48; i++) {
+        const spread = 18 + i * 2.2;
+        candidates.push(preferredY + (Math.random() * 2 - 1) * spread);
+    }
+    // 最後は画面上を広くランダム探索して、必ず候補を拾えるようにする。
+    for (let i = 0; i < 80; i++) {
+        candidates.push(minY + Math.random() * (maxY - minY));
+    }
+
+    for (const y of candidates) {
+        const candidate = { x, y, w: PLATFORM_CELL_SIZE, h: PLATFORM_CELL_SIZE, upper: movingPlatform.upper };
+        const clampedY = Math.max(minY, Math.min(maxY, y));
+        candidate.y = clampedY;
+        const conflict = platforms.some(q => q !== movingPlatform && platformRectsOverlap(candidate, q));
+        if (!conflict) return clampedY;
+    }
+
+    // 十分な隙間が取れない場合は、上側から順に空いている場所を探索する。
+    for (let y = minY; y <= maxY; y += 8) {
+        const candidate = { x, y, w: PLATFORM_CELL_SIZE, h: PLATFORM_CELL_SIZE, upper: movingPlatform.upper };
+        if (!platforms.some(q => q !== movingPlatform && platformRectsOverlap(candidate, q))) return y;
+    }
+    return Math.max(minY, Math.min(maxY, preferredY));
+}
+
+function setupPlatforms() {
+    const h = canvas.height, w = canvas.width;
+    const cellW = PLATFORM_CELL_SIZE;
+    const cellH = PLATFORM_CELL_SIZE;
+    platformSequenceIndex = 0;
+    platforms = [];
+
+    // 現在の千鳥配置を「4段 × 4個」に拡張し、合計16個を初期配置する。
+    // 各段を左右にずらして、画像のような千鳥状のリズムを維持する。
+    const rowY = [0.12, 0.34, 0.56, 0.78];
+    const baseX = [0.02, 0.26, 0.50, 0.74];
+    const stagger = w * 0.12;
+
+    for (let row = 0; row < 4; row++) {
+        const y = Math.max(24, Math.min(h - cellH - 54, h * rowY[row]));
+        const rowOffset = (row % 2 === 0) ? 0 : stagger;
+
+        for (let col = 0; col < 4; col++) {
+            let x = w * baseX[col] + rowOffset;
+            // 右端にはみ出しすぎないように調整。
+            x = Math.min(w - cellW * 0.18, x);
+
+            platforms.push({
+                x,
+                y,
+                w: cellW,
+                h: cellH,
+                type: stage,
+                upper: false,
+                patternIndex: row * 4 + col,
+                patternRow: row,
+                patternCol: col
+            });
+        }
+    }
+}
+
+function resetRun() {
+    hitCount = 0; playerInvincibleUntil = 0; frameCount = 0; gameStartTime = performance.now(); clearTimeMs = 0;
+    player.x = 70; player.y = canvas.height * (56 / 64) - player.h;
+    player.vx = 0; player.vy = 0; player.isJumping = false; player.shootTimer = 0;
+    playerBullets = []; enemyBullets = []; enemies = [];
+    setupPlatforms();
+}
+function restartGame(){
+    gameResult = 'CLEAR';
+    resetRun();
+    tutorialActive = false;
+    tutorialComplete = true;
+    choiceSelection = 0;
+    startStage(1);
+    setGameState('PLAYING');
+}
+function beginTutorial(){resetRun();setGameState('PLAYING');tutorialActive=true;tutorialComplete=false;tutorialStep=0;tutorialStartX=player.x;tutorialJumpSeen=false;tutorialJumpLanded=false;tutorialAttackStarted=false;enemies=[];waveState='TUTORIAL_MOVE';}
+function beginStageWithoutTutorial() {
+    resetRun();
+    tutorialActive = false; tutorialComplete = true;
+    setGameState('PLAYING');
+    startStage(1);
+}
+function startGame(){setGameState('TUTORIAL_CHOICE');choiceSelection=0;}
+function proceedToNextStage(){if(stage<3){startStage(stage+1);setGameState('PLAYING');}else{gameResult='CLEAR';clearTimeMs=performance.now()-gameStartTime;setGameState('GAMEOVER');}}
+
+// 60fps固定ステップ
+// MacBook Proで従来のフレーム基準のゲーム速度を基準値として、
+// 30/60/120Hzなど表示機器やブラウザの描画速度に左右されないようにする。
+const FIXED_STEP_MS = 1000 / 60;
+const MAP_SCROLL_SPEED = 0.7;
+const PLATFORM_SCALE = 2.5;
+const PLATFORM_CELL_SIZE = 64 * PLATFORM_SCALE;
+const PLATFORM_ACTIVE_W = 40 * PLATFORM_SCALE;
+const PLATFORM_ACTIVE_H = 15 * PLATFORM_SCALE;
+const PLATFORM_ACTIVE_OFFSET_Y = 24 * PLATFORM_SCALE;
+const PLATFORM_MIN_GAP = 8;
+let platformSequenceIndex = 0;
+let lastFrameTime = performance.now();
+let fixedAccumulator = 0;
+
+function loop(timestamp) {
+    const elapsed = Math.min(250, Math.max(0, timestamp - lastFrameTime));
+    lastFrameTime = timestamp;
+    fixedAccumulator += elapsed * gameSpeedMultiplier;
+
+    // ゲームロジックは常に60回/秒の固定速度を基準に、F4で2倍速へ切り替える。
+    // 極端な負荷時の無限追いつきは避けつつ、通常時は正確に追従する。
+    let safetySteps = 0;
+    while (fixedAccumulator >= FIXED_STEP_MS && safetySteps < 8) {
+        update();
+        input.justPressed = {};
+        fixedAccumulator -= FIXED_STEP_MS;
+        safetySteps++;
+    }
+
+    draw();
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
